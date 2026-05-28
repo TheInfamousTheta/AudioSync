@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  jiosaavn-api:
+    image: ghcr.io/sumitkolhe/jiosaavn-api:latest
+    ports:
+      - "3000:3000"
+    restart: always
+
+  backend:
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER}/audio-sync-backend:latest
+    ports:
+      - "4000:4000"
+    volumes:
+      - sqlite_data:/app/data
+    env_file:
+      - .env
+    environment:
+      - PORT=4000
+      - SAAVN_API_URL=http://jiosaavn-api:3000
+    depends_on:
+      - jiosaavn-api
+    restart: always
+
+volumes:
+  sqlite_data:
