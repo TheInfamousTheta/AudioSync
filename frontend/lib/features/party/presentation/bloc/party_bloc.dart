@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:audio_sync/core/network/api_client.dart';
 import '../../data/services/party_sync_service.dart';
@@ -14,35 +13,11 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
   StreamSubscription? _logSubscription;
   StreamSubscription? _songSubscription;
   StreamSubscription? _trackSubscription;
-  String? _sessionToken;
   Timer? _refreshTimer;
+  final List<String> _debugLogs = [];
+  String _debugResult = 'Standing by for synchronization...';
 
-  Future<String> _retrieveToken() async {
-    if (_sessionToken != null && _sessionToken!.isNotEmpty) {
-      return _sessionToken!;
-    }
-    try {
-      final f = File('.midnight_token');
-      if (await f.exists()) {
-        final token = await f.readAsString();
-        if (token.trim().isNotEmpty) {
-          _sessionToken = token.trim();
-          return _sessionToken!;
-        }
-      }
-    } catch (_) {}
-    try {
-      final f = File('${Directory.systemTemp.path}/.midnight_token');
-      if (await f.exists()) {
-        final token = await f.readAsString();
-        if (token.trim().isNotEmpty) {
-          _sessionToken = token.trim();
-          return _sessionToken!;
-        }
-      }
-    } catch (_) {}
-    return "";
-  }
+
 
   PartyBloc() : super(PartyInitialState()) {
     
@@ -93,16 +68,14 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
 
 
     on<CreatePartyEvent>((event, emit) async {
+      _debugLogs.clear();
+      _debugResult = 'Standing by for synchronization...';
       emit(PartyLoadingState());
       try {
         final result = await _apiClient.createParty(event.token);
         final partyJson = result['party'];
         final partyId = partyJson['id'] as String;
         final inviteCode = partyJson['inviteCode'] as String;
-        final hostId = partyJson['hostId'] as String;
-
-        _sessionToken = event.token;
-
         await _syncService.initialize();
         _syncService.localUsername = event.username;
         _syncService.isHost = true;
@@ -112,6 +85,9 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
         final members = details['members'] as List<dynamic>;
         final playlistJson = details['playlist'] as List<dynamic>;
         final playlist = playlistJson.map((t) => MediaTrack.fromJson(t)).toList();
+
+        _syncService.hostId = hostId;
+        _syncService.members = members;
 
         emit(PartyJoinedState(
           partyId: partyId,
@@ -124,6 +100,8 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           isPlaying: _syncService.isSongPlaying,
           activeTrack: _syncService.activeTrack,
           sessionToken: event.token,
+          debugLogs: List<String>.from(_debugLogs),
+          debugResult: _debugResult,
         ));
 
         // 30s periodic fallback refresh in case WS events are missed
@@ -147,6 +125,8 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
     });
 
     on<JoinPartyRoomEvent>((event, emit) async {
+      _debugLogs.clear();
+      _debugResult = 'Standing by for synchronization...';
       emit(PartyLoadingState());
       try {
         final cleanCode = event.partyId.trim().toUpperCase();
@@ -172,6 +152,9 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
         final playlistJson = details['playlist'] as List<dynamic>;
         final playlist = playlistJson.map((t) => MediaTrack.fromJson(t)).toList();
 
+        _syncService.hostId = partyJson['hostId'] as String;
+        _syncService.members = members;
+
         emit(PartyJoinedState(
           partyId: actualPartyId,
           hostId: partyJson['hostId'] as String,
@@ -183,6 +166,8 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           isPlaying: _syncService.isSongPlaying,
           activeTrack: _syncService.activeTrack,
           sessionToken: event.token,
+          debugLogs: List<String>.from(_debugLogs),
+          debugResult: _debugResult,
         ));
 
         // 30s periodic fallback refresh
@@ -210,6 +195,8 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
         final members = details['members'] as List<dynamic>;
         final playlistJson = details['playlist'] as List<dynamic>;
         final playlist = playlistJson.map((t) => MediaTrack.fromJson(t)).toList();
+
+        _syncService.members = members;
 
         emit(currentState.copyWith(
           members: members,
@@ -396,6 +383,8 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
     });
 
     on<EnterOfflineSyncModeEvent>((event, emit) async {
+      _debugLogs.clear();
+      _debugResult = 'Standing by for synchronization...';
       emit(PartyLoadingState());
       try {
         await _syncService.initialize();
@@ -411,6 +400,8 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           isOffline: true,
           isPlaying: _syncService.isSongPlaying,
           activeTrack: _syncService.activeTrack,
+          debugLogs: List<String>.from(_debugLogs),
+          debugResult: _debugResult,
         ));
       } catch (e) {
         emit(PartyFailureState("BLE Sync launch failure: $e"));
@@ -418,19 +409,21 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
     });
 
     on<UpdatePartyDebugInfoEvent>((event, emit) {
+      if (event.log != null) {
+        _debugLogs.insert(0, "[${DateTime.now().toString().substring(11, 19)}] ${event.log}");
+        if (_debugLogs.length > 100) {
+          _debugLogs.removeRange(100, _debugLogs.length);
+        }
+      }
+      if (event.debugResult != null) {
+        _debugResult = event.debugResult!;
+      }
+
       final currentState = state;
       if (currentState is PartyJoinedState) {
-        List<String> newLogs = currentState.debugLogs;
-        if (event.log != null) {
-          newLogs = List<String>.from(currentState.debugLogs)
-            ..insert(0, "[${DateTime.now().toString().substring(11, 19)}] ${event.log}");
-          if (newLogs.length > 100) {
-            newLogs = newLogs.sublist(0, 100);
-          }
-        }
         emit(currentState.copyWith(
-          debugLogs: newLogs,
-          debugResult: event.debugResult ?? currentState.debugResult,
+          debugLogs: List<String>.from(_debugLogs),
+          debugResult: _debugResult,
         ));
       }
     });
@@ -439,6 +432,8 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       _refreshTimer?.cancel();
       _syncService.stopAudio();
       await _syncService.disconnect();
+      _debugLogs.clear();
+      _debugResult = 'Standing by for synchronization...';
       emit(PartyInitialState());
     });
   }

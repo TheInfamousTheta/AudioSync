@@ -64,6 +64,48 @@ class PartySyncService {
   final Map<String, Map<String, dynamic>> _alignmentDataMap = {};
   Completer<void>? _syncCompleter;
 
+  // Multi-client FDMA coordination variables
+  String? hostId;
+  List<dynamic> members = const [];
+  Uint8List? _hostCapturedMonoBuffer;
+  int? _hostTSelf;
+
+  int getGuestIndex(String targetUserId) {
+    final guests = members.where((m) {
+      final mUserId = m['userId'] as String? ?? '';
+      return mUserId != hostId;
+    }).toList();
+    
+    guests.sort((a, b) {
+      final String idA = a['userId'] as String? ?? '';
+      final String idB = b['userId'] as String? ?? '';
+      return idA.compareTo(idB);
+    });
+
+    final idx = guests.indexWhere((m) {
+      final mUserId = m['userId'] as String? ?? '';
+      return mUserId == targetUserId;
+    });
+    return idx != -1 ? idx : 0;
+  }
+
+  int getMyGuestIndex() {
+    if (localUsername == null) return 0;
+    final guests = members.where((m) {
+      final mUserId = m['userId'] as String? ?? '';
+      return mUserId != hostId;
+    }).toList();
+    
+    guests.sort((a, b) {
+      final String idA = a['userId'] as String? ?? '';
+      final String idB = b['userId'] as String? ?? '';
+      return idA.compareTo(idB);
+    });
+
+    final idx = guests.indexWhere((m) => m['username'] == localUsername);
+    return idx != -1 ? idx : 0;
+  }
+
   Future<void> initialize() async {
     if (!SoLoud.instance.isInitialized) {
       await SoLoud.instance.init();
@@ -198,58 +240,70 @@ class PartySyncService {
 
         _alignmentDataMap[userId] = {'tSelf': tSelf, 'tCross': tCross, 'username': username};
 
-        if (isHost) {
-          // Find host's own alignment data in the map
-          Map<String, dynamic>? hostAlign;
-          String? hostId;
-          _alignmentDataMap.forEach((uid, val) {
-            if (val['username'] == localUsername) {
-              hostAlign = val;
-              hostId = uid;
+        if (isHost && userId != hostId && _hostCapturedMonoBuffer != null && _hostTSelf != null) {
+          // Calculate guest index in deterministic sorted list
+          final int guestIndex = getGuestIndex(userId);
+          
+          final double gStart = 3500.0 + (guestIndex.clamp(0, 3) * 400.0);
+          final double gEnd = 3800.0 + (guestIndex.clamp(0, 3) * 400.0);
+          final int targetRate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
+
+          onLogUpdate?.call("⚡ Correlating $username on sub-band ${gStart.round()}–${gEnd.round()}Hz (Index: $guestIndex)...");
+
+          // Run single correlation inside background isolate to avoid UI thread lag
+          final template = DSPEngine.generateChirpTemplate(
+            fStart: gStart,
+            fEnd: gEnd,
+            targetSampleRate: targetRate,
+          );
+
+          Isolate.run(() {
+            return DSPEngine.locatePeakIndex(
+              DSPEngine.convertBytesToFloat32(_hostCapturedMonoBuffer!),
+              template,
+            );
+          }).then((tCrossPc) {
+            if (tCrossPc == -1) {
+              onLogUpdate?.call("⚠️ Failed to locate peak for $username (clashing / weak signal).");
+              return;
             }
-          });
 
-          if (hostAlign != null) {
-            final int tSelfPc = hostAlign!['tSelf'] as int;
-            final int tCrossPc = hostAlign!['tCross'] as int;
+            onLogUpdate?.call("🎯 Peak located for $username: tCrossPc=$tCrossPc");
 
-            // Compute offset for any CLIENT that is NOT the host
-            _alignmentDataMap.forEach((uid, val) {
-              if (uid != hostId) {
-                final int tSelfPhone = val['tSelf'] as int;
-                final int tCrossPhone = val['tCross'] as int;
-                final String clientUsername = val['username'] as String;
+            // Calculate relative delay offset using double chirps consensus
+            final double dtPhone = (tCross - tSelf) / DSPEngine.sampleRate;
+            final double dtPc = (tCrossPc - _hostTSelf!) / targetRate.toDouble();
+            final double rawMsOffset = ((dtPhone - dtPc) / 2) * 1000;
 
-                // Calculate relative delay offset using double chirps consensus
-                final double dtPhone = (tCrossPhone - tSelfPhone) / DSPEngine.sampleRate;
-                final double dtPc = (tCrossPc - tSelfPc) / (Platform.isWindows ? 48000.0 : DSPEngine.sampleRate.toDouble());
-                final double rawMsOffset = ((dtPhone - dtPc) / 2) * 1000;
+            onLogUpdate?.call("🎯 Acoustic Sync consensus for $username: ${rawMsOffset.toStringAsFixed(2)} ms");
 
-                onLogUpdate?.call("🎯 Acoustic Sync consensus computed for client $clientUsername: ${rawMsOffset.toStringAsFixed(2)} ms");
+            onCalculationComplete?.call(
+              rawMsOffset, 
+              rawMsOffset.abs() * 0.343, 
+              "Lock: $username delay is ${rawMsOffset.round()}ms",
+            );
 
-                if (rawMsOffset < 0) {
-                  // Host is leading: Host delays itself, Client plays immediately (0 delay)
-                  _hostAcousticDelay = rawMsOffset.abs().round();
-                  _sendSocketMessage('sync:offset', {
-                    'userId': uid,
-                    'offsetMs': 0,
-                  });
-                } else {
-                  // Client is leading: Client delays itself, Host plays immediately (0 delay)
-                  _hostAcousticDelay = 0;
-                  _sendSocketMessage('sync:offset', {
-                    'userId': uid,
-                    'offsetMs': rawMsOffset.round(),
-                  });
-                }
-              }
-            });
+            if (rawMsOffset < 0) {
+              // Host is leading: Host delays itself, Client plays immediately (0 delay)
+              _hostAcousticDelay = rawMsOffset.abs().round();
+              _sendSocketMessage('sync:offset', {
+                'userId': userId,
+                'offsetMs': 0,
+              });
+            } else {
+              // Client is leading: Client delays itself, Host plays immediately (0 delay)
+              _hostAcousticDelay = 0;
+              _sendSocketMessage('sync:offset', {
+                'userId': userId,
+                'offsetMs': rawMsOffset.round(),
+              });
+            }
 
             // Complete the sync barrier completer since consensus was computed
             if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
               _syncCompleter!.complete();
             }
-          }
+          });
         }
         break;
       }
@@ -267,6 +321,12 @@ class PartySyncService {
         if (myUserId.isNotEmpty && targetUserId == myUserId) {
           _acousticOffset = offsetMs;
           onLogUpdate?.call("🎯 Acoustic calibration lock applied to player pipeline: ${_acousticOffset}ms delay compensation");
+
+          onCalculationComplete?.call(
+            _acousticOffset.toDouble(),
+            0.0,
+            "Calibration Lock: ${_acousticOffset}ms compensation",
+          );
         }
         break;
       }
@@ -338,17 +398,38 @@ class PartySyncService {
     final int targetRate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
     final bool isPC = Platform.isWindows;
 
-    // Two distinct chirp bands: local device emits 'self' chirp, cross-template matches remote device's band
-    final Float32List selfChirpData = DSPEngine.generateChirpTemplate(
-      fStart: isPC ? 1500 : 3500,
-      fEnd: isPC ? 3000 : 5000,
-      targetSampleRate: targetRate
-    );
-    final Float32List crossChirpData = DSPEngine.generateChirpTemplate(
-      fStart: isPC ? 3500 : 1500,
-      fEnd: isPC ? 5000 : 3000,
-      targetSampleRate: targetRate
-    );
+    // Allocate dynamic sub-band based on Host/Client FDMA roles
+    Float32List selfChirpData;
+    Float32List crossChirpData;
+
+    if (isHost) {
+      // Host always emits Low Band (1.5kHz–3.0kHz), correlates against own Low Band for tSelf
+      selfChirpData = DSPEngine.generateChirpTemplate(
+        fStart: 1500.0,
+        fEnd: 3000.0,
+        targetSampleRate: targetRate,
+      );
+      // Dummy cross chirp template since Host correlates clients dynamically inside sync:alignment event
+      crossChirpData = selfChirpData;
+    } else {
+      // Client emits dynamic sub-band based on sorted list index, correlates against Host's Low Band
+      final int guestIndex = getMyGuestIndex();
+      final double cStart = 3500.0 + (guestIndex.clamp(0, 3) * 400.0);
+      final double cEnd = 3800.0 + (guestIndex.clamp(0, 3) * 400.0);
+
+      onLogUpdate?.call("⚡ Assigned Client dynamic sub-band: ${cStart.round()}–${cEnd.round()}Hz (Index: $guestIndex)");
+
+      selfChirpData = DSPEngine.generateChirpTemplate(
+        fStart: cStart,
+        fEnd: cEnd,
+        targetSampleRate: targetRate,
+      );
+      crossChirpData = DSPEngine.generateChirpTemplate(
+        fStart: 1500.0,
+        fEnd: 3000.0,
+        targetSampleRate: targetRate,
+      );
+    }
 
     // Convert self chirp to WAV and load into SoLoud
     final Uint8List wavBytes = _packageFloatsToWav(selfChirpData, targetRate);
@@ -387,7 +468,7 @@ class PartySyncService {
     final Uint8List capturedBuffer = Uint8List(targetLength);
 
     // Emit chirp instantly
-    onLogUpdate?.call("🔊 Emitting calibration chirp (${isPC ? '1.5–3.0' : '3.5–5.0'}kHz — audible reference).");
+    onLogUpdate?.call("🔊 Emitting calibration chirp (${isHost ? '1.5–3.0' : 'dynamic High'}kHz — audible reference).");
     if (Platform.isWindows) {
       if (_activeChirpSource != null) {
         SoLoud.instance.play(_activeChirpSource!);
@@ -418,30 +499,57 @@ class PartySyncService {
       monoBuffer = _extractMonoFromMultichannel(capturedBuffer, 4);
     }
 
-    final dspArgs = BackgroundDSPArgs(
-      rawCapturedBytes: monoBuffer,
-      selfTemplate: selfChirpData,
-      crossTemplate: crossChirpData,
-    );
+    if (isHost) {
+      // Host saves captured monoBuffer to correlate guest chirps on demand
+      _hostCapturedMonoBuffer = monoBuffer;
 
-    final dspAnalysis = await Isolate.run(() {
-      return DSPEngine.processAudioBackground(dspArgs);
-    });
+      // Correlate Host's Low Band against raw capture to locate host's own tSelf
+      final dspAnalysis = await Isolate.run(() {
+        final dspArgs = BackgroundDSPArgs(
+          rawCapturedBytes: monoBuffer,
+          selfTemplate: selfChirpData,
+          crossTemplate: selfChirpData,
+        );
+        return DSPEngine.processAudioBackground(dspArgs);
+      });
 
-    // Cleanup Soloud buffer immediately to purge heap
-    if (_activeChirpSource != null) {
-      SoLoud.instance.disposeSource(_activeChirpSource!);
-      _activeChirpSource = null;
+      _hostTSelf = dspAnalysis.tSelf;
+      _isAcousticSyncing = false;
+      onLogUpdate?.call("🎯 Host capture completed. Local self peak index: $_hostTSelf");
+
+      // Register host's own alignment for consensus
+      _alignmentDataMap[hostId ?? "host"] = {
+        'tSelf': _hostTSelf,
+        'tCross': _hostTSelf,
+        'username': localUsername,
+      };
+    } else {
+      // Guest processes self & cross correlations as usual
+      final dspArgs = BackgroundDSPArgs(
+        rawCapturedBytes: monoBuffer,
+        selfTemplate: selfChirpData,
+        crossTemplate: crossChirpData,
+      );
+
+      final dspAnalysis = await Isolate.run(() {
+        return DSPEngine.processAudioBackground(dspArgs);
+      });
+
+      // Cleanup Soloud buffer immediately to purge heap
+      if (_activeChirpSource != null) {
+        SoLoud.instance.disposeSource(_activeChirpSource!);
+        _activeChirpSource = null;
+      }
+
+      _isAcousticSyncing = false;
+      onLogUpdate?.call("🎯 Acoustic capture completed. Peak index: ${dspAnalysis.tSelf}");
+      
+      // Send alignment consensus data to Room Coordinator
+      _sendSocketMessage('sync:alignment', {
+        'tSelf': dspAnalysis.tSelf,
+        'tCross': dspAnalysis.tCross,
+      });
     }
-
-    _isAcousticSyncing = false;
-    onLogUpdate?.call("🎯 Acoustic capture completed. Peak index: ${dspAnalysis.tSelf}");
-    
-    // Send alignment consensus data to Room Coordinator
-    _sendSocketMessage('sync:alignment', {
-      'tSelf': dspAnalysis.tSelf,
-      'tCross': dspAnalysis.tCross,
-    });
   }
 
   /// Compensated WAN execution

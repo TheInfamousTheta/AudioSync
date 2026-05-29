@@ -68,7 +68,7 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
 
   Widget _buildSetupView() {
     return SingleChildScrollView(
-      physics: const BouncingScrollPhysics(),
+      physics: const AlwaysScrollableScrollPhysics(parent: BouncingScrollPhysics()),
       child: Padding(
         padding: const EdgeInsets.all(24.0),
         child: Column(
@@ -279,210 +279,6 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
   Widget _buildJoinedPartyView(PartyJoinedState state) {
     return Column(
       children: [
-        // Premium Header
-        Padding(
-          padding: const EdgeInsets.all(24.0),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    state.isOffline ? 'OFFLINE SYNC' : 'PARTY ACTIVE',
-                    style: TextStyle(
-                      fontFamily: 'Manrope',
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold,
-                      color: state.isOffline ? Colors.orangeAccent : AppColors.primaryNeon,
-                      letterSpacing: 1.5,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    'Code: ${state.inviteCode}',
-                    style: const TextStyle(
-                      fontFamily: 'Plus Jakarta Sans',
-                      fontSize: 22,
-                      fontWeight: FontWeight.bold,
-                      color: AppColors.onSurface,
-                    ),
-                  ),
-                ],
-              ),
-              Row(
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.share_rounded, color: AppColors.onSurface),
-                    onPressed: () {
-                      final String cleanBase = AppConfig.apiBaseUrl.replaceAll('/api/v1', '');
-                      final inviteUrl = '$cleanBase/party/join/${state.inviteCode}';
-                      Clipboard.setData(ClipboardData(text: inviteUrl)).then((_) {
-                        if (!mounted) return;
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
-                            backgroundColor: AppColors.surfaceBright.withValues(alpha: 0.9),
-                            content: const Row(
-                              children: [
-                                Icon(Icons.check_circle_outline_rounded, color: AppColors.primaryNeon, size: 20),
-                                SizedBox(width: 8),
-                                Text(
-                                  'Invite link copied to clipboard!',
-                                  style: TextStyle(color: AppColors.onSurface, fontFamily: 'Manrope', fontWeight: FontWeight.bold),
-                                ),
-                              ],
-                            ),
-                            duration: const Duration(seconds: 2),
-                          ),
-                        );
-                      });
-                    },
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.exit_to_app_rounded, color: Colors.redAccent),
-                    onPressed: () {
-                      context.read<PartyBloc>().add(DisconnectPartyEvent());
-                    },
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-
-        if (kDebugMode)
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 8.0),
-            child: GlassContainer(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Row(
-                    children: [
-                      const Icon(Icons.bug_report_rounded, color: AppColors.primaryNeon, size: 18),
-                      const SizedBox(width: 8),
-                      const Text(
-                        'DEBUG MATRIX & OUTPUT CONSOLE',
-                        style: TextStyle(
-                          fontFamily: 'Manrope',
-                          fontSize: 11,
-                          fontWeight: FontWeight.bold,
-                          color: AppColors.primaryNeon,
-                          letterSpacing: 1.0,
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  // Calibration Status Card
-                  Container(
-                    padding: const EdgeInsets.all(12.0),
-                    decoration: BoxDecoration(
-                      color: AppColors.containerLow,
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Colors.white10),
-                    ),
-                    child: Text(
-                      state.debugResult,
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontFamily: 'monospace',
-                        fontSize: 12,
-                        fontWeight: FontWeight.bold,
-                        color: state.debugResult.contains('❌') 
-                            ? Colors.redAccent 
-                            : state.debugResult.contains('Lock') 
-                                ? AppColors.primaryNeon 
-                                : Colors.amberAccent,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  const Text(
-                    "System Output Console Logs:", 
-                    style: TextStyle(fontFamily: 'Manrope', fontSize: 11, fontWeight: FontWeight.bold, color: AppColors.subText)
-                  ),
-                  const SizedBox(height: 6),
-                  Container(
-                    height: 120,
-                    decoration: BoxDecoration(
-                      color: Colors.black.withValues(alpha: 0.6),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Colors.white10),
-                    ),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: ListView.builder(
-                        physics: const BouncingScrollPhysics(),
-                        padding: const EdgeInsets.all(12),
-                        itemCount: state.debugLogs.length,
-                        itemBuilder: (context, index) => Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 2.0),
-                          child: Text(
-                            state.debugLogs[index],
-                            style: const TextStyle(fontFamily: 'monospace', fontSize: 11, color: Colors.white70),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  if (state.playlist.isNotEmpty && state.isHost) ...[
-                    const SizedBox(height: 12),
-                    ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.orange.withValues(alpha: 0.1),
-                        foregroundColor: Colors.orangeAccent,
-                        side: const BorderSide(color: Colors.orangeAccent, width: 1.0),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-                        padding: const EdgeInsets.symmetric(vertical: 12),
-                      ),
-                      onPressed: () {
-                        final trackToPlay = state.activeTrack ?? state.playlist.first;
-                        context.read<PartyBloc>().add(PlayTrackUnsyncedEvent(trackToPlay));
-                      },
-                      icon: const Icon(Icons.flash_off_rounded, size: 16),
-                      label: Text(
-                        state.activeTrack != null 
-                            ? 'FORCE PLAY UNSYNCED ("${state.activeTrack!.title}")' 
-                            : 'PLAY FIRST TRACK UNSYNCED',
-                        style: const TextStyle(fontFamily: 'Plus Jakarta Sans', fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 0.5),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-
-        // Collaborative Playlist Queue Title
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 24.0),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text(
-                'Collaborative Queue',
-                style: TextStyle(fontFamily: 'Plus Jakarta Sans', fontSize: 18, fontWeight: FontWeight.bold, color: AppColors.onSurface),
-              ),
-              IconButton(
-                icon: Icon(_showSearchSection ? Icons.close_rounded : Icons.add_circle_outline_rounded, color: AppColors.primaryNeon),
-                onPressed: () {
-                  setState(() => _showSearchSection = !_showSearchSection);
-                },
-              ),
-            ],
-          ),
-        ),
-
-        // Search Interface (For adding tracks)
-        if (_showSearchSection)
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 8.0),
-            child: _buildSearchSection(state),
-          ),
-
-        // Playlist Queue
         Expanded(
           child: RefreshIndicator(
             color: AppColors.primaryNeon,
@@ -491,92 +287,306 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
               context.read<PartyBloc>().add(LoadPartyDetailsEvent(partyId: state.partyId, token: ""));
               await Future.delayed(const Duration(milliseconds: 600));
             },
-            child: state.playlist.isEmpty
-                ? SingleChildScrollView(
-                    physics: const AlwaysScrollableScrollPhysics(parent: BouncingScrollPhysics()),
-                    child: SizedBox(
-                      height: 400,
-                      child: _buildEmptyQueueView(state),
-                    ),
-                  )
-                : ListView.builder(
-                    physics: const AlwaysScrollableScrollPhysics(parent: BouncingScrollPhysics()),
-                    padding: const EdgeInsets.symmetric(horizontal: 24.0),
-                    itemCount: state.playlist.length,
-                    itemBuilder: (context, index) {
-                      final track = state.playlist[index];
-                      final isCurrentTrack = state.activeTrack?.id == track.id;
-                      
-                      // Host can remove any; Member can only remove their own added tracks
-                      final canDelete = state.isHost || !state.isOffline; // Strict rules applied inside bloc
-
-                      return Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 8.0),
-                        child: Container(
-                          padding: const EdgeInsets.all(12.0),
-                          decoration: BoxDecoration(
-                            color: isCurrentTrack 
-                                ? AppColors.surfaceBright.withValues(alpha: 0.5) 
-                                : AppColors.surfaceContainerLow.withValues(alpha: 0.5),
-                            borderRadius: BorderRadius.circular(16.0),
-                            border: Border.all(
-                              color: isCurrentTrack ? AppColors.primaryNeon.withValues(alpha: 0.3) : AppColors.ghostBorder,
-                            ),
-                          ),
-                          child: Row(
-                            children: [
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(8),
-                                child: Image.network(track.coverArtUrl, width: 48, height: 48, fit: BoxFit.cover),
+            child: SingleChildScrollView(
+              physics: const AlwaysScrollableScrollPhysics(parent: BouncingScrollPhysics()),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // Premium Header
+                  Padding(
+                    padding: const EdgeInsets.all(24.0),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              state.isOffline ? 'OFFLINE SYNC' : 'PARTY ACTIVE',
+                              style: TextStyle(
+                                fontFamily: 'Manrope',
+                                fontSize: 10,
+                                fontWeight: FontWeight.bold,
+                                color: state.isOffline ? Colors.orangeAccent : AppColors.primaryNeon,
+                                letterSpacing: 1.5,
                               ),
-                              const SizedBox(width: 16),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              'Code: ${state.inviteCode}',
+                              style: const TextStyle(
+                                fontFamily: 'Plus Jakarta Sans',
+                                fontSize: 22,
+                                fontWeight: FontWeight.bold,
+                                color: AppColors.onSurface,
+                              ),
+                            ),
+                          ],
+                        ),
+                        Row(
+                          children: [
+                            IconButton(
+                              icon: const Icon(Icons.share_rounded, color: AppColors.onSurface),
+                              onPressed: () {
+                                final String cleanBase = AppConfig.apiBaseUrl.replaceAll('/api/v1', '');
+                                final inviteUrl = '$cleanBase/party/join/${state.inviteCode}';
+                                Clipboard.setData(ClipboardData(text: inviteUrl)).then((_) {
+                                  if (!mounted) return;
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      backgroundColor: AppColors.surfaceBright.withValues(alpha: 0.9),
+                                      content: const Row(
+                                        children: [
+                                          Icon(Icons.check_circle_outline_rounded, color: AppColors.primaryNeon, size: 20),
+                                          SizedBox(width: 8),
+                                          Text(
+                                            'Invite link copied to clipboard!',
+                                            style: TextStyle(color: AppColors.onSurface, fontFamily: 'Manrope', fontWeight: FontWeight.bold),
+                                          ),
+                                        ],
+                                      ),
+                                      duration: const Duration(seconds: 2),
+                                    ),
+                                  );
+                                });
+                              },
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.exit_to_app_rounded, color: Colors.redAccent),
+                              onPressed: () {
+                                context.read<PartyBloc>().add(DisconnectPartyEvent());
+                              },
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  // Active Party Members Section
+                  _buildMembersSection(state),
+
+                  if (kDebugMode)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 8.0),
+                      child: GlassContainer(
+                        padding: const EdgeInsets.all(16.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Row(
+                              children: [
+                                const Icon(Icons.bug_report_rounded, color: AppColors.primaryNeon, size: 18),
+                                const SizedBox(width: 8),
+                                const Text(
+                                  'DEBUG MATRIX & OUTPUT CONSOLE',
+                                  style: TextStyle(
+                                    fontFamily: 'Manrope',
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.bold,
+                                    color: AppColors.primaryNeon,
+                                    letterSpacing: 1.0,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 12),
+                            // Calibration Status Card
+                            Container(
+                              padding: const EdgeInsets.all(12.0),
+                              decoration: BoxDecoration(
+                                color: AppColors.containerLow,
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(color: Colors.white10),
+                              ),
+                              child: Text(
+                                state.debugResult,
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontFamily: 'monospace',
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                  color: state.debugResult.contains('❌') 
+                                      ? Colors.redAccent 
+                                      : state.debugResult.contains('Lock') 
+                                          ? AppColors.primaryNeon 
+                                          : Colors.amberAccent,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            const Text(
+                              "System Output Console Logs:", 
+                              style: TextStyle(fontFamily: 'Manrope', fontSize: 11, fontWeight: FontWeight.bold, color: AppColors.subText)
+                            ),
+                            const SizedBox(height: 6),
+                            Container(
+                              height: 120,
+                              decoration: BoxDecoration(
+                                color: Colors.black.withValues(alpha: 0.6),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(color: Colors.white10),
+                              ),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(12),
+                                child: ListView.builder(
+                                  physics: const BouncingScrollPhysics(),
+                                  padding: const EdgeInsets.all(12),
+                                  itemCount: state.debugLogs.length,
+                                  itemBuilder: (context, index) => Padding(
+                                    padding: const EdgeInsets.symmetric(vertical: 2.0),
+                                    child: Text(
+                                      state.debugLogs[index],
+                                      style: const TextStyle(fontFamily: 'monospace', fontSize: 11, color: Colors.white70),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            if (state.playlist.isNotEmpty && state.isHost) ...[
+                              const SizedBox(height: 12),
+                              ElevatedButton.icon(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.orange.withValues(alpha: 0.1),
+                                  foregroundColor: Colors.orangeAccent,
+                                  side: const BorderSide(color: Colors.orangeAccent, width: 1.0),
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                ),
+                                onPressed: () {
+                                  final trackToPlay = state.activeTrack ?? state.playlist.first;
+                                  context.read<PartyBloc>().add(PlayTrackUnsyncedEvent(trackToPlay));
+                                },
+                                icon: const Icon(Icons.flash_off_rounded, size: 16),
+                                label: Text(
+                                  state.activeTrack != null 
+                                      ? 'FORCE PLAY UNSYNCED ("${state.activeTrack!.title}")' 
+                                      : 'PLAY FIRST TRACK UNSYNCED',
+                                  style: const TextStyle(fontFamily: 'Plus Jakarta Sans', fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+
+                  // Collaborative Playlist Queue Title
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 24.0),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Collaborative Queue',
+                          style: TextStyle(fontFamily: 'Plus Jakarta Sans', fontSize: 18, fontWeight: FontWeight.bold, color: AppColors.onSurface),
+                        ),
+                        IconButton(
+                          icon: Icon(_showSearchSection ? Icons.close_rounded : Icons.add_circle_outline_rounded, color: AppColors.primaryNeon),
+                          onPressed: () {
+                            setState(() => _showSearchSection = !_showSearchSection);
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  // Search Interface (For adding tracks)
+                  if (_showSearchSection)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 8.0),
+                      child: _buildSearchSection(state),
+                    ),
+
+                  // Playlist Queue
+                  state.playlist.isEmpty
+                      ? SizedBox(
+                          height: 300,
+                          child: _buildEmptyQueueView(state),
+                        )
+                      : ListView.builder(
+                          shrinkWrap: true,
+                          physics: const NeverScrollableScrollPhysics(),
+                          padding: const EdgeInsets.symmetric(horizontal: 24.0),
+                          itemCount: state.playlist.length,
+                          itemBuilder: (context, index) {
+                            final track = state.playlist[index];
+                            final isCurrentTrack = state.activeTrack?.id == track.id;
+                            
+                            // Host can remove any; Member can only remove their own added tracks
+                            final canDelete = state.isHost || !state.isOffline; // Strict rules applied inside bloc
+
+                            return Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 8.0),
+                              child: Container(
+                                padding: const EdgeInsets.all(12.0),
+                                decoration: BoxDecoration(
+                                  color: isCurrentTrack 
+                                      ? AppColors.surfaceBright.withValues(alpha: 0.5) 
+                                      : AppColors.surfaceContainerLow.withValues(alpha: 0.5),
+                                  borderRadius: BorderRadius.circular(16.0),
+                                  border: Border.all(
+                                    color: isCurrentTrack ? AppColors.primaryNeon.withValues(alpha: 0.3) : AppColors.ghostBorder,
+                                  ),
+                                ),
+                                child: Row(
                                   children: [
-                                    Text(
-                                      track.title,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(fontWeight: FontWeight.bold, color: AppColors.onSurface, fontSize: 14),
+                                    ClipRRect(
+                                      borderRadius: BorderRadius.circular(8),
+                                      child: Image.network(track.coverArtUrl, width: 48, height: 48, fit: BoxFit.cover),
                                     ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      track.artistName,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(color: AppColors.subText, fontSize: 11),
+                                    const SizedBox(width: 16),
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            track.title,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(fontWeight: FontWeight.bold, color: AppColors.onSurface, fontSize: 14),
+                                          ),
+                                          const SizedBox(height: 2),
+                                          Text(
+                                            track.artistName,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(color: AppColors.subText, fontSize: 11),
+                                          ),
+                                        ],
+                                      ),
                                     ),
+                                    if (isCurrentTrack && state.isPlaying)
+                                      IconButton(
+                                        icon: const Icon(Icons.pause_rounded, color: AppColors.primaryNeon),
+                                        onPressed: () {
+                                          context.read<PartyBloc>().add(TogglePartyPlayStateEvent());
+                                        },
+                                      )
+                                    else if (state.isHost)
+                                      IconButton(
+                                        icon: const Icon(Icons.play_arrow_rounded, color: AppColors.primaryNeon),
+                                        onPressed: () {
+                                          context.read<PartyBloc>().add(PlayTrackSyncedEvent(track));
+                                        },
+                                      ),
+                                    if (canDelete)
+                                      IconButton(
+                                        icon: const Icon(Icons.delete_outline_rounded, color: Colors.white38),
+                                        onPressed: () {
+                                          context.read<PartyBloc>().add(RemoveTrackFromPartyQueueEvent(track.id));
+                                        },
+                                      ),
                                   ],
                                 ),
                               ),
-                              if (isCurrentTrack && state.isPlaying)
-                                IconButton(
-                                  icon: const Icon(Icons.pause_rounded, color: AppColors.primaryNeon),
-                                  onPressed: () {
-                                    context.read<PartyBloc>().add(TogglePartyPlayStateEvent());
-                                  },
-                                )
-                              else if (state.isHost)
-                                IconButton(
-                                  icon: const Icon(Icons.play_arrow_rounded, color: AppColors.primaryNeon),
-                                  onPressed: () {
-                                    context.read<PartyBloc>().add(PlayTrackSyncedEvent(track));
-                                  },
-                                ),
-                              if (canDelete)
-                                IconButton(
-                                  icon: const Icon(Icons.delete_outline_rounded, color: Colors.white38),
-                                  onPressed: () {
-                                    context.read<PartyBloc>().add(RemoveTrackFromPartyQueueEvent(track.id));
-                                  },
-                                ),
-                            ],
-                          ),
+                            );
+                          },
                         ),
-                      );
-                    },
-                  ),
+                  const SizedBox(height: 32),
+                ],
+              ),
+            ),
           ),
         ),
 
@@ -584,6 +594,83 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
         if (state.activeTrack != null)
           _buildSyncedMiniPlayer(state),
       ],
+    );
+  }
+
+  Widget _buildMembersSection(PartyJoinedState state) {
+    if (state.members.isEmpty) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 8.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'ACTIVE PARTY MEMBERS',
+            style: TextStyle(
+              fontFamily: 'Manrope',
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+              color: AppColors.primaryNeon,
+              letterSpacing: 1.5,
+            ),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 38,
+            child: ListView.builder(
+              scrollDirection: Axis.horizontal,
+              physics: const BouncingScrollPhysics(),
+              itemCount: state.members.length,
+              itemBuilder: (context, index) {
+                final member = state.members[index];
+                // Check if this member is the host
+                final memberUserId = member['userId'] as String? ?? '';
+                final isMemberHost = memberUserId == state.hostId;
+                
+                return Padding(
+                  padding: const EdgeInsets.only(right: 8.0),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: isMemberHost 
+                          ? AppColors.primaryNeon.withValues(alpha: 0.15) 
+                          : AppColors.containerLow,
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: isMemberHost 
+                            ? AppColors.primaryNeon.withValues(alpha: 0.4) 
+                            : Colors.white10,
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          isMemberHost ? Icons.star_rounded : Icons.person_outline_rounded,
+                          size: 14,
+                          color: isMemberHost ? AppColors.primaryNeon : AppColors.onSurface,
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          member['username'] ?? 'User',
+                          style: TextStyle(
+                            fontFamily: 'Manrope',
+                            fontSize: 12,
+                            fontWeight: isMemberHost ? FontWeight.bold : FontWeight.normal,
+                            color: isMemberHost ? AppColors.primaryNeon : AppColors.onSurface,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
+      ),
     );
   }
 
