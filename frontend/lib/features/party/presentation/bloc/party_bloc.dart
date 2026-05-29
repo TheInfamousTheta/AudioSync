@@ -5,6 +5,7 @@ import '../../data/services/party_sync_service.dart';
 import 'party_event.dart';
 import 'party_state.dart';
 import 'package:audio_sync/features/home/dashboard_payload.dart';
+import 'package:audio_sync/core/widgets/download_manager.dart';
 
 class PartyBloc extends Bloc<PartyEvent, PartyState> {
   final ApiClient _apiClient = ApiClient();
@@ -23,6 +24,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
     
     // Wire the underlying high-fidelity synchronization engine listeners
     _syncService.onLogUpdate = (log) {
+      // ignore: avoid_print
       print("[SYNC-CORE] $log");
       add(UpdatePartyDebugInfoEvent(log: log));
     };
@@ -76,6 +78,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
         final partyJson = result['party'];
         final partyId = partyJson['id'] as String;
         final inviteCode = partyJson['inviteCode'] as String;
+        final hostId = partyJson['hostId'] as String;
         await _syncService.initialize();
         _syncService.localUsername = event.username;
         _syncService.isHost = true;
@@ -88,6 +91,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
 
         _syncService.hostId = hostId;
         _syncService.members = members;
+        await _syncService.preloadChirpPlayer();
 
         emit(PartyJoinedState(
           partyId: partyId,
@@ -138,8 +142,6 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
         // 2. Join using UUID
         await _apiClient.joinParty(actualPartyId, event.token);
 
-        _sessionToken = event.token;
-
         // 3. Connect WebSocket using UUID
         await _syncService.initialize();
         _syncService.localUsername = event.username;
@@ -154,6 +156,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
 
         _syncService.hostId = partyJson['hostId'] as String;
         _syncService.members = members;
+        await _syncService.preloadChirpPlayer();
 
         emit(PartyJoinedState(
           partyId: actualPartyId,
@@ -196,12 +199,27 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
         final playlistJson = details['playlist'] as List<dynamic>;
         final playlist = playlistJson.map((t) => MediaTrack.fromJson(t)).toList();
 
+        _syncService.isHost = currentState.isHost;
         _syncService.members = members;
+        await _syncService.preloadChirpPlayer();
 
         emit(currentState.copyWith(
           members: members,
           playlist: playlist,
         ));
+
+        // Background-download all tracks in the playlist to pre-cache them
+        for (final track in playlist) {
+          if (track.audioStreamUrl.isNotEmpty) {
+            DownloadManager().downloadTrack(track).then((_) {
+              // ignore: avoid_print
+              print("[SYNC-PRECACHE] Pre-cached track ${track.title} successfully!");
+            }).catchError((err) {
+              // ignore: avoid_print
+              print("[SYNC-PRECACHE] Pre-cache failed for ${track.title}: $err");
+            });
+          }
+        }
       } catch (_) {
         // Fallback: preserve active list on network hiccup
       }
@@ -247,6 +265,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
         _syncService.broadcastPlaylistUpdate();
         add(LoadPartyDetailsEvent(partyId: currentState.partyId, token: token));
       } catch (e) {
+        // ignore: avoid_print
         print("[BLOC] Failed to append track to collaborative queue: $e");
         emit(PartyFailureState("Failed to add track: ${e.toString().replaceAll('Exception: ', '')}"));
         emit(currentState); // Restore state so user isn't kicked out
@@ -269,6 +288,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
         await _apiClient.removeTrackFromPartyPlaylist(currentState.partyId, event.queueId, token);
         add(LoadPartyDetailsEvent(partyId: currentState.partyId, token: token));
       } catch (e) {
+        // ignore: avoid_print
         print("[BLOC] Failed to remove track from collaborative queue: $e");
         emit(PartyFailureState("Failed to remove track: ${e.toString().replaceAll('Exception: ', '')}"));
         emit(currentState);
@@ -307,8 +327,13 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           );
         }
         await _syncService.broadcastPlay(track);
-        emit(currentState.copyWith(isPlaying: true, activeTrack: track));
+        
+        final freshState = state;
+        if (freshState is PartyJoinedState) {
+          emit(freshState.copyWith(isPlaying: true, activeTrack: track));
+        }
       } catch (e) {
+        // ignore: avoid_print
         print("[BLOC] Synced track broadcast playback failed: $e");
       }
     });
@@ -341,11 +366,103 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           );
         }
         await _syncService.broadcastPlayUnsynced(track);
-        emit(currentState.copyWith(isPlaying: true, activeTrack: track));
+        
+        final freshState = state;
+        if (freshState is PartyJoinedState) {
+          emit(freshState.copyWith(isPlaying: true, activeTrack: track));
+        }
       } catch (e) {
+        // ignore: avoid_print
         print("[BLOC] Unsynced track broadcast playback failed: $e");
       }
     });
+
+    on<PlayTestSoundSyncedEvent>((event, emit) async {
+      final currentState = state;
+      if (currentState is! PartyJoinedState) return;
+
+      try {
+        final mockTrack = MediaTrack(
+          id: 'test_sound_track',
+          title: '⚡ Test Sync Sound',
+          artistName: 'System Diagnostic',
+          albumTitle: 'System Diagnostic',
+          coverArtUrl: '',
+          audioStreamUrl: '',
+          formatBadge: 'Hi-Res',
+          durationInSeconds: 1,
+        );
+        
+        await _syncService.broadcastPlay(mockTrack);
+        
+        final freshState = state;
+        if (freshState is PartyJoinedState) {
+          emit(freshState.copyWith(isPlaying: true, activeTrack: mockTrack));
+        }
+      } catch (e) {
+        // ignore: avoid_print
+        print("[BLOC] Synced test sound broadcast failed: $e");
+      }
+    });
+
+    on<PlayTestSoundUnsyncedEvent>((event, emit) async {
+      final currentState = state;
+      if (currentState is! PartyJoinedState) return;
+
+      try {
+        final mockTrack = MediaTrack(
+          id: 'test_sound_track',
+          title: '⚡ Test Sync Sound',
+          artistName: 'System Diagnostic',
+          albumTitle: 'System Diagnostic',
+          coverArtUrl: '',
+          audioStreamUrl: '',
+          formatBadge: 'Hi-Res',
+          durationInSeconds: 1,
+        );
+        
+        await _syncService.broadcastPlayUnsynced(mockTrack);
+        
+        final freshState = state;
+        if (freshState is PartyJoinedState) {
+          emit(freshState.copyWith(isPlaying: true, activeTrack: mockTrack));
+        }
+      } catch (e) {
+        // ignore: avoid_print
+        print("[BLOC] Unsynced test sound broadcast failed: $e");
+      }
+    });
+
+    on<PlayTestSoundNoNtpEvent>((event, emit) async {
+      final currentState = state;
+      if (currentState is! PartyJoinedState) return;
+
+      try {
+        final mockTrack = MediaTrack(
+          id: 'test_sound_track',
+          title: '⚡ Test Sync Sound',
+          artistName: 'System Diagnostic',
+          albumTitle: 'System Diagnostic',
+          coverArtUrl: '',
+          audioStreamUrl: '',
+          formatBadge: 'Hi-Res',
+          durationInSeconds: 1,
+        );
+        
+        await _syncService.broadcastPlayNoNtp(mockTrack);
+        
+        final freshState = state;
+        if (freshState is PartyJoinedState) {
+          emit(freshState.copyWith(isPlaying: true, activeTrack: mockTrack));
+        }
+      } catch (e) {
+        // ignore: avoid_print
+        print("[BLOC] No-NTP test sound broadcast failed: $e");
+      }
+    });
+
+
+
 
     on<TogglePartyPlayStateEvent>((event, emit) async {
       final currentState = state;
@@ -355,21 +472,34 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
         if (currentState.isHost) {
           if (currentState.isPlaying) {
             await _syncService.broadcastPause();
-            emit(currentState.copyWith(isPlaying: false));
+            final freshState = state;
+            if (freshState is PartyJoinedState) {
+              emit(freshState.copyWith(isPlaying: false));
+            }
           } else if (currentState.activeTrack != null) {
             await _syncService.broadcastPlay(currentState.activeTrack!);
-            emit(currentState.copyWith(isPlaying: true));
+            final freshState = state;
+            if (freshState is PartyJoinedState) {
+              emit(freshState.copyWith(isPlaying: true));
+            }
           }
         } else {
           if (currentState.isPlaying) {
             _syncService.pauseLocalPlayer();
-            emit(currentState.copyWith(isPlaying: false));
+            final freshState = state;
+            if (freshState is PartyJoinedState) {
+              emit(freshState.copyWith(isPlaying: false));
+            }
           } else if (currentState.activeTrack != null) {
             _syncService.resumeLocalPlayer();
-            emit(currentState.copyWith(isPlaying: true));
+            final freshState = state;
+            if (freshState is PartyJoinedState) {
+              emit(freshState.copyWith(isPlaying: true));
+            }
           }
         }
       } catch (e) {
+        // ignore: avoid_print
         print("[BLOC] Playback state toggle failed: $e");
       }
     });
@@ -378,6 +508,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       try {
         await _syncService.broadcastSeek(event.positionInSeconds);
       } catch (e) {
+        // ignore: avoid_print
         print("[BLOC] Playback seek failed: $e");
       }
     });

@@ -67,3 +67,12 @@ class PlayTrackUnsyncedEvent extends PartyEvent {
   final MediaTrack track;
   PlayTrackUnsyncedEvent(this.track);
 }
+
+class PlayTestSoundSyncedEvent extends PartyEvent {}
+
+class PlayTestSoundUnsyncedEvent extends PartyEvent {}
+
+class PlayTestSoundNoNtpEvent extends PartyEvent {}
+
+
+

@@ -139,4 +139,21 @@ class DSPEngine {
     }
     return float32Data;
   }
+
+  /// Generates a Float32 click/pop sound with rapid exponential decay envelope for alignment tests
+  static Float32List generateTestSound({
+    double freq = 2500.0,
+    double duration = 0.15,
+    required int targetSampleRate,
+  }) {
+    final int numSamples = (targetSampleRate * duration).toInt();
+    final Float32List sound = Float32List(numSamples);
+    for (int i = 0; i < numSamples; i++) {
+      double t = i / targetSampleRate;
+      double envelope = math.exp(-12.0 * t); // slightly slower decay for much higher audibility
+      sound[i] = math.sin(2 * math.pi * freq * t) * envelope;
+    }
+    return sound;
+  }
 }
+

@@ -55,6 +55,8 @@ class PartySyncService {
   BluetoothCharacteristic? _bleSyncCharacteristic;
   StreamSubscription? _bleSubscription;
   bool isOfflineMode = false;
+  bool _isPreloadingChirp = false;
+  bool _isStartingMic = false;
 
   // Real-time Acoustic Synchronization Matrix states
   String? localUsername;
@@ -62,6 +64,7 @@ class PartySyncService {
   int _acousticOffset = 0;
   int _hostAcousticDelay = 0;
   final Map<String, Map<String, dynamic>> _alignmentDataMap = {};
+  final Map<String, Map<String, dynamic>> _pendingGuestAlignments = {};
   Completer<void>? _syncCompleter;
 
   // Multi-client FDMA coordination variables
@@ -69,6 +72,10 @@ class PartySyncService {
   List<dynamic> members = const [];
   Uint8List? _hostCapturedMonoBuffer;
   int? _hostTSelf;
+
+  // Self-healing calibration retry state variables
+  int _calibrationRetryCount = 0;
+  static const int maxCalibrationRetries = 3;
 
   int getGuestIndex(String targetUserId) {
     final guests = members.where((m) {
@@ -106,10 +113,102 @@ class PartySyncService {
     return idx != -1 ? idx : 0;
   }
 
+  Future<void> _preloadAllChirpsToDisk() async {
+    if (Platform.isWindows) return;
+    try {
+      final tempDir = await getTemporaryDirectory();
+      
+      // 1. Preload Host Chirp
+      final hostChirp = DSPEngine.generateChirpTemplate(
+        fStart: 1500.0,
+        fEnd: 3000.0,
+        targetSampleRate: DSPEngine.sampleRate,
+      );
+      final hostWav = _packageFloatsToWav(hostChirp, DSPEngine.sampleRate);
+      final hostFile = File('${tempDir.path}/host_chirp_template.wav');
+      await hostFile.writeAsBytes(hostWav);
+      
+      // 2. Preload Guest Chirps
+      for (int i = 0; i < 4; i++) {
+        final double cStart = 3500.0 + (i * 400.0);
+        final double cEnd = 3800.0 + (i * 400.0);
+        final guestChirp = DSPEngine.generateChirpTemplate(
+          fStart: cStart,
+          fEnd: cEnd,
+          targetSampleRate: DSPEngine.sampleRate,
+        );
+        final guestWav = _packageFloatsToWav(guestChirp, DSPEngine.sampleRate);
+        final guestFile = File('${tempDir.path}/guest_chirp_template_$i.wav');
+        await guestFile.writeAsBytes(guestWav);
+      }
+      onLogUpdate?.call("⚡ All calibration chirp templates preloaded on disk successfully!");
+    } catch (e) {
+      onLogUpdate?.call("⚠️ Failed preloading calibration chirps: $e");
+    }
+  }
+
+  Future<void> preloadChirpPlayer() async {
+    if (Platform.isWindows) return;
+    if (_isPreloadingChirp) {
+      onLogUpdate?.call("⏳ Preload already in progress. Skipping duplicate request.");
+      return;
+    }
+    _isPreloadingChirp = true;
+    try {
+      final tempDir = await getTemporaryDirectory();
+      String path;
+      if (isHost) {
+        path = '${tempDir.path}/host_chirp_template.wav';
+      } else {
+        final int guestIndex = getMyGuestIndex();
+        path = '${tempDir.path}/guest_chirp_template_${guestIndex.clamp(0, 3)}.wav';
+      }
+      
+      // Verify file exists, if not generate it on the fly
+      final file = File(path);
+      if (!await file.exists()) {
+        onLogUpdate?.call("⚠️ Chirp file not found at $path. Re-generating...");
+        await _preloadAllChirpsToDisk();
+      }
+
+      // Check if path is already loaded to avoid redundant setAudioSource calls!
+      if (_dynamicChirpPath == path && _chirpPlayer.audioSource != null) {
+        onLogUpdate?.call("📦 Chirp template already preloaded. Skipping redundant setAudioSource.");
+        _isPreloadingChirp = false;
+        return;
+      }
+
+      _dynamicChirpPath = path;
+      onLogUpdate?.call("📦 Preloading chirp player with template: $path");
+      
+      // Stop to clear active play state and prevent auto-play on source change
+      await _chirpPlayer.stop();
+      
+      await _chirpPlayer.setAudioSource(ja.AudioSource.file(path));
+      await _chirpPlayer.setVolume(1.0);
+    } catch (e) {
+      onLogUpdate?.call("⚠️ Failed to preload chirp player: $e");
+    } finally {
+      _isPreloadingChirp = false;
+    }
+  }
+
+  static Future<BackgroundDSPResult> runBackgroundDSPIsolate(BackgroundDSPArgs args) {
+    return Isolate.run(() => DSPEngine.processAudioBackground(args));
+  }
+
+  static Future<int> runLocatePeakIsolate(Float32List signal, Float32List template) {
+    return Isolate.run(() => DSPEngine.locatePeakIndex(signal, template));
+  }
+
   Future<void> initialize() async {
     if (!SoLoud.instance.isInitialized) {
       await SoLoud.instance.init();
     }
+    // 1. Generate and write wav files to disk first (fast, no permissions needed)
+    await _preloadAllChirpsToDisk();
+    
+    // 2. Start microphone stream in the background (may prompt OS permission dialog)
     await _startContinuousMicrophoneStream();
 
     // Register stream event listeners for robust debug feedback
@@ -226,6 +325,7 @@ class PartySyncService {
 
       case 'sync:trigger': {
         onLogUpdate?.call("🎙️ Sync trigger frame received from server. Running acoustic alignment...");
+        onCalculationComplete?.call(0.0, 0.0, "⚡ Syncing: calibration in progress...");
         executeDynamicAcousticSync();
         break;
       }
@@ -240,70 +340,20 @@ class PartySyncService {
 
         _alignmentDataMap[userId] = {'tSelf': tSelf, 'tCross': tCross, 'username': username};
 
-        if (isHost && userId != hostId && _hostCapturedMonoBuffer != null && _hostTSelf != null) {
-          // Calculate guest index in deterministic sorted list
-          final int guestIndex = getGuestIndex(userId);
-          
-          final double gStart = 3500.0 + (guestIndex.clamp(0, 3) * 400.0);
-          final double gEnd = 3800.0 + (guestIndex.clamp(0, 3) * 400.0);
-          final int targetRate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
-
-          onLogUpdate?.call("⚡ Correlating $username on sub-band ${gStart.round()}–${gEnd.round()}Hz (Index: $guestIndex)...");
-
-          // Run single correlation inside background isolate to avoid UI thread lag
-          final template = DSPEngine.generateChirpTemplate(
-            fStart: gStart,
-            fEnd: gEnd,
-            targetSampleRate: targetRate,
-          );
-
-          Isolate.run(() {
-            return DSPEngine.locatePeakIndex(
-              DSPEngine.convertBytesToFloat32(_hostCapturedMonoBuffer!),
-              template,
-            );
-          }).then((tCrossPc) {
-            if (tCrossPc == -1) {
-              onLogUpdate?.call("⚠️ Failed to locate peak for $username (clashing / weak signal).");
-              return;
-            }
-
-            onLogUpdate?.call("🎯 Peak located for $username: tCrossPc=$tCrossPc");
-
-            // Calculate relative delay offset using double chirps consensus
-            final double dtPhone = (tCross - tSelf) / DSPEngine.sampleRate;
-            final double dtPc = (tCrossPc - _hostTSelf!) / targetRate.toDouble();
-            final double rawMsOffset = ((dtPhone - dtPc) / 2) * 1000;
-
-            onLogUpdate?.call("🎯 Acoustic Sync consensus for $username: ${rawMsOffset.toStringAsFixed(2)} ms");
-
-            onCalculationComplete?.call(
-              rawMsOffset, 
-              rawMsOffset.abs() * 0.343, 
-              "Lock: $username delay is ${rawMsOffset.round()}ms",
-            );
-
-            if (rawMsOffset < 0) {
-              // Host is leading: Host delays itself, Client plays immediately (0 delay)
-              _hostAcousticDelay = rawMsOffset.abs().round();
-              _sendSocketMessage('sync:offset', {
-                'userId': userId,
-                'offsetMs': 0,
-              });
-            } else {
-              // Client is leading: Client delays itself, Host plays immediately (0 delay)
-              _hostAcousticDelay = 0;
-              _sendSocketMessage('sync:offset', {
-                'userId': userId,
-                'offsetMs': rawMsOffset.round(),
-              });
-            }
-
-            // Complete the sync barrier completer since consensus was computed
-            if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
-              _syncCompleter!.complete();
-            }
-          });
+        if (isHost && userId != hostId) {
+          if (_hostCapturedMonoBuffer != null && _hostTSelf != null) {
+            // Host correlation is done! Process instantly.
+            _correlateGuestAndComputeConsensus(userId, username, tSelf, tCross);
+          } else {
+            // Host is still recording/correlating! Queue alignment.
+            _pendingGuestAlignments[userId] = {
+              'userId': userId,
+              'username': username,
+              'tSelf': tSelf,
+              'tCross': tCross,
+            };
+            onLogUpdate?.call("⏳ Host correlation pending. Queued $username's alignment.");
+          }
         }
         break;
       }
@@ -312,11 +362,26 @@ class PartySyncService {
         final targetUserId = data['userId'] as String;
         final offsetMs = data['offsetMs'] as int;
 
-        // Find my own record by localUsername in the alignment data map
-        final myUserId = _alignmentDataMap.keys.firstWhere(
-          (uid) => _alignmentDataMap[uid]?['username'] == localUsername,
-          orElse: () => "",
-        );
+        // Find my own record by localUsername in members list or alignment data map as fallback
+        var myUserId = "";
+        try {
+          final myMember = members.firstWhere(
+            (m) => m['username'] == localUsername,
+            orElse: () => null,
+          );
+          if (myMember != null) {
+            myUserId = myMember['userId'] as String? ?? "";
+          }
+        } catch (_) {}
+
+        if (myUserId.isEmpty) {
+          try {
+            myUserId = _alignmentDataMap.keys.firstWhere(
+              (uid) => _alignmentDataMap[uid]?['username'] == localUsername,
+              orElse: () => "",
+            );
+          } catch (_) {}
+        }
 
         if (myUserId.isNotEmpty && targetUserId == myUserId) {
           _acousticOffset = offsetMs;
@@ -335,10 +400,30 @@ class PartySyncService {
         final track = MediaTrack.fromJson(data);
         final playAtServer = data['playAt'] as int;
         final bool isUnsynced = data['isUnsynced'] == true;
+        final bool isNoNtp = data['isNoNtp'] == true;
+        onLogUpdate?.call("📥 playback:play received from socket. track: '${track.title}', isUnsynced: $isUnsynced, isNoNtp: $isNoNtp");
+
+        if (isNoNtp) {
+          _acousticOffset = 0;
+          onLogUpdate?.call("📢 No-NTP play directive received. Playing instantly upon packet receipt.");
+          
+          if (isHost) {
+            onLogUpdate?.call("📢 Skipping redundant No-NTP play directive received from myself.");
+            break;
+          }
+          
+          _executeCompensatedPlayback(track, 0);
+          break;
+        }
 
         if (isUnsynced) {
           _acousticOffset = 0;
           onLogUpdate?.call("📢 Unsynced play directive received. Resetting calibration offsets.");
+          
+          if (isHost) {
+            onLogUpdate?.call("📢 Skipping redundant unsynced play directive received from myself.");
+            break;
+          }
         }
 
         activeTrack = track;
@@ -391,164 +476,215 @@ class PartySyncService {
 
   /// Dynamically synthesizes chirp on-demand, plays via Soloud, records mic, and processes in background Isolate
   Future<void> executeDynamicAcousticSync() async {
-    if (_isAcousticSyncing || !_isMicStreaming) return;
-    _isAcousticSyncing = true;
-    onLogUpdate?.call("⚡ Generating dynamic calibration chirps in-memory...");
+    try {
+      // 1. INSTANTLY STOP AND SILENCE MUSIC PLAYER TO PREVENT ACOUSTIC SATURATION
+      try {
+        if (_musicPlayer.playing) {
+          onLogUpdate?.call("🤫 Sync trigger received. Stopping music player instantly to clear noise floor.");
+          await _musicPlayer.stop();
+        }
+      } catch (_) {}
 
-    final int targetRate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
-    final bool isPC = Platform.isWindows;
+      if (_isAcousticSyncing) {
+        onLogUpdate?.call("⏳ Acoustic sync already in progress. Skipping.");
+        return;
+      }
+      _isAcousticSyncing = true;
 
-    // Allocate dynamic sub-band based on Host/Client FDMA roles
-    Float32List selfChirpData;
-    Float32List crossChirpData;
+      if (!_isMicStreaming) {
+        onLogUpdate?.call("🎙️ Mic stream not active. Attempting to start stream on the fly...");
+        await _startContinuousMicrophoneStream();
+      }
 
-    if (isHost) {
-      // Host always emits Low Band (1.5kHz–3.0kHz), correlates against own Low Band for tSelf
-      selfChirpData = DSPEngine.generateChirpTemplate(
-        fStart: 1500.0,
-        fEnd: 3000.0,
-        targetSampleRate: targetRate,
-      );
-      // Dummy cross chirp template since Host correlates clients dynamically inside sync:alignment event
-      crossChirpData = selfChirpData;
-    } else {
-      // Client emits dynamic sub-band based on sorted list index, correlates against Host's Low Band
-      final int guestIndex = getMyGuestIndex();
-      final double cStart = 3500.0 + (guestIndex.clamp(0, 3) * 400.0);
-      final double cEnd = 3800.0 + (guestIndex.clamp(0, 3) * 400.0);
+      onLogUpdate?.call("⚡ Generating dynamic calibration chirps...");
 
-      onLogUpdate?.call("⚡ Assigned Client dynamic sub-band: ${cStart.round()}–${cEnd.round()}Hz (Index: $guestIndex)");
+      final int targetRate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
+      final bool isPC = Platform.isWindows;
 
-      selfChirpData = DSPEngine.generateChirpTemplate(
-        fStart: cStart,
-        fEnd: cEnd,
-        targetSampleRate: targetRate,
-      );
-      crossChirpData = DSPEngine.generateChirpTemplate(
-        fStart: 1500.0,
-        fEnd: 3000.0,
-        targetSampleRate: targetRate,
-      );
-    }
+      // Allocate dynamic sub-band based on Host/Client FDMA roles
+      Float32List selfChirpData;
+      Float32List crossChirpData;
 
-    // Convert self chirp to WAV and load into SoLoud
-    final Uint8List wavBytes = _packageFloatsToWav(selfChirpData, targetRate);
+      if (isHost) {
+        selfChirpData = DSPEngine.generateChirpTemplate(
+          fStart: 1500.0,
+          fEnd: 3000.0,
+          targetSampleRate: targetRate,
+        );
+        crossChirpData = selfChirpData;
+      } else {
+        final int guestIndex = getMyGuestIndex();
+        final double cStart = 3500.0 + (guestIndex.clamp(0, 3) * 400.0);
+        final double cEnd = 3800.0 + (guestIndex.clamp(0, 3) * 400.0);
 
-    // Load dynamic WAV directly into SoLoud heap
-    if (Platform.isWindows) {
+        onLogUpdate?.call("⚡ Assigned Client dynamic sub-band: ${cStart.round()}–${cEnd.round()}Hz (Index: $guestIndex)");
+
+        selfChirpData = DSPEngine.generateChirpTemplate(
+          fStart: cStart,
+          fEnd: cEnd,
+          targetSampleRate: targetRate,
+        );
+        crossChirpData = DSPEngine.generateChirpTemplate(
+          fStart: 1500.0,
+          fEnd: 3000.0,
+          targetSampleRate: targetRate,
+        );
+      }
+
+      // Load dynamic WAV directly into SoLoud heap
+      final Uint8List wavBytes = _packageFloatsToWav(selfChirpData, targetRate);
+      bool playedViaSoLoud = false;
       try {
         _activeChirpSource = await SoLoud.instance.loadMem(
           "dynamic_calibration_chirp.wav",
           wavBytes,
           mode: LoadMode.memory,
         );
-        onLogUpdate?.call("⚡ Dynamic chirp loaded to SoLoud memory.");
-      } catch (e) {
-        onLogUpdate?.call("❌ Dynamic chirp synthesis failed: $e");
-        _isAcousticSyncing = false;
-        return;
-      }
-    } else {
-      try {
-        final tempDir = await getTemporaryDirectory();
-        final chirpFile = File('${tempDir.path}/dynamic_chirp.wav');
-        await chirpFile.writeAsBytes(wavBytes);
-        _dynamicChirpPath = chirpFile.path;
-        onLogUpdate?.call("⚡ Dynamic chirp saved to temp file.");
-      } catch (e) {
-        onLogUpdate?.call("❌ Dynamic chirp file save failed: $e");
-        _isAcousticSyncing = false;
-        return;
-      }
-    }
-
-    // Acoustic timeline capture
-    final snapshotStartMarker = _totalBytesRecorded;
-    final int targetLength = (targetRate * 1.5 * (Platform.isWindows ? 8 : 2)).toInt(); // channels * 2 bytes
-    final Uint8List capturedBuffer = Uint8List(targetLength);
-
-    // Emit chirp instantly
-    onLogUpdate?.call("🔊 Emitting calibration chirp (${isHost ? '1.5–3.0' : 'dynamic High'}kHz — audible reference).");
-    if (Platform.isWindows) {
-      if (_activeChirpSource != null) {
+        onLogUpdate?.call("⚡ Dynamic chirp loaded to SoLoud memory successfully.");
         SoLoud.instance.play(_activeChirpSource!);
+        playedViaSoLoud = true;
+      } catch (e) {
+        onLogUpdate?.call("⚠️ SoLoud chirp playback failed, falling back to just_audio: $e");
       }
-    } else if (_dynamicChirpPath != null) {
-      await _chirpPlayer.setAudioSource(ja.AudioSource.file(_dynamicChirpPath!));
-      await _chirpPlayer.setVolume(1.0);
-      _chirpPlayer.play();
-    }
 
-    // Await 1.5s recording snapshot
-    await Future.delayed(const Duration(milliseconds: 1500));
+      // Emit chirp instantly (using SoLoud or just_audio fallback)
+      onLogUpdate?.call("🔊 Emitting calibration chirp (${isHost ? '1.5–3.0' : 'dynamic High'}kHz — audible reference).");
+      if (!playedViaSoLoud) {
+        try {
+          if (_dynamicChirpPath == null) {
+            await preloadChirpPlayer();
+          }
+          await _chirpPlayer.seek(Duration.zero);
+          _chirpPlayer.play();
+        } catch (e) {
+          onLogUpdate?.call("❌ Fallback chirp playback failed: $e");
+        }
+      }
 
-    // Extract snapshot from circular mic buffer
-    int startIdx = snapshotStartMarker % _circularBuffer.length;
-    if (startIdx < 0) startIdx += _circularBuffer.length;
-    if (startIdx + targetLength <= _circularBuffer.length) {
-      capturedBuffer.setRange(0, targetLength, _circularBuffer, startIdx);
-    } else {
-      final part1 = _circularBuffer.length - startIdx;
-      capturedBuffer.setRange(0, part1, _circularBuffer, startIdx);
-      capturedBuffer.setRange(part1, targetLength, _circularBuffer, 0);
-    }
+      // 2. CHECK MICROPHONE STREAM STATUS BEFORE RECORDING SNAPSHOT
+      if (!_isMicStreaming) {
+        onLogUpdate?.call("⚠️ Microphone stream inactive. Cannot capture calibration snapshot.");
+        _isAcousticSyncing = false;
+        onCalculationComplete?.call(0.0, 0.0, "❌ Calibration failed. Mic stream inactive.");
+        
+        // Send failed alignment immediately so we don't block
+        if (!isHost) {
+          _sendSocketMessage('sync:alignment', {
+            'tSelf': -1,
+            'tCross': -1,
+            'username': localUsername,
+          });
+        }
+        return;
+      }
 
-    // Process mono conversion if multichannel (Windows microphone inputs)
-    Uint8List monoBuffer = capturedBuffer;
-    if (isPC) {
-      monoBuffer = _extractMonoFromMultichannel(capturedBuffer, 4);
-    }
+      // Acoustic timeline capture
+      final snapshotStartMarker = _totalBytesRecorded;
+      final int targetLength = (targetRate * 1.5 * (Platform.isWindows ? 8 : 2)).toInt(); // channels * 2 bytes
+      final Uint8List capturedBuffer = Uint8List(targetLength);
 
-    if (isHost) {
-      // Host saves captured monoBuffer to correlate guest chirps on demand
-      _hostCapturedMonoBuffer = monoBuffer;
+      // Await 1.5s recording snapshot
+      await Future.delayed(const Duration(milliseconds: 1500));
 
-      // Correlate Host's Low Band against raw capture to locate host's own tSelf
-      final dspAnalysis = await Isolate.run(() {
+      // Stop player to clear playing state
+      try {
+        _chirpPlayer.stop();
+      } catch (_) {}
+
+      // Extract snapshot from circular mic buffer
+      int startIdx = snapshotStartMarker % _circularBuffer.length;
+      if (startIdx < 0) startIdx += _circularBuffer.length;
+      if (startIdx + targetLength <= _circularBuffer.length) {
+        capturedBuffer.setRange(0, targetLength, _circularBuffer, startIdx);
+      } else {
+        final part1 = _circularBuffer.length - startIdx;
+        capturedBuffer.setRange(0, part1, _circularBuffer, startIdx);
+        capturedBuffer.setRange(part1, targetLength, _circularBuffer, 0);
+      }
+
+      // Process mono conversion if multichannel (Windows microphone inputs)
+      Uint8List monoBuffer = capturedBuffer;
+      if (isPC) {
+        monoBuffer = _extractMonoFromMultichannel(capturedBuffer, 4);
+      }
+
+      if (isHost) {
+        // Host saves captured monoBuffer to correlate guest chirps on demand
+        _hostCapturedMonoBuffer = monoBuffer;
+
+        // Correlate Host's Low Band against raw capture to locate host's own tSelf
         final dspArgs = BackgroundDSPArgs(
           rawCapturedBytes: monoBuffer,
           selfTemplate: selfChirpData,
           crossTemplate: selfChirpData,
         );
-        return DSPEngine.processAudioBackground(dspArgs);
-      });
+        final dspAnalysis = await PartySyncService.runBackgroundDSPIsolate(dspArgs);
 
-      _hostTSelf = dspAnalysis.tSelf;
-      _isAcousticSyncing = false;
-      onLogUpdate?.call("🎯 Host capture completed. Local self peak index: $_hostTSelf");
+        _hostTSelf = dspAnalysis.tSelf;
+        _isAcousticSyncing = false;
+        onLogUpdate?.call("🎯 Host capture completed. Local self peak index: $_hostTSelf");
 
-      // Register host's own alignment for consensus
-      _alignmentDataMap[hostId ?? "host"] = {
-        'tSelf': _hostTSelf,
-        'tCross': _hostTSelf,
-        'username': localUsername,
-      };
-    } else {
-      // Guest processes self & cross correlations as usual
-      final dspArgs = BackgroundDSPArgs(
-        rawCapturedBytes: monoBuffer,
-        selfTemplate: selfChirpData,
-        crossTemplate: crossChirpData,
-      );
+        // Register host's own alignment for consensus
+        _alignmentDataMap[hostId ?? "host"] = {
+          'tSelf': _hostTSelf,
+          'tCross': _hostTSelf,
+          'username': localUsername,
+        };
 
-      final dspAnalysis = await Isolate.run(() {
-        return DSPEngine.processAudioBackground(dspArgs);
-      });
+        // Process any pending guest alignments that arrived early!
+        if (_pendingGuestAlignments.isNotEmpty) {
+          onLogUpdate?.call("⚡ Processing ${_pendingGuestAlignments.length} pending guest alignments...");
+          final pendingCopy = Map<String, Map<String, dynamic>>.from(_pendingGuestAlignments);
+          _pendingGuestAlignments.clear();
+          
+          pendingCopy.forEach((uid, alignData) {
+            _correlateGuestAndComputeConsensus(
+              alignData['userId'] as String,
+              alignData['username'] as String,
+              alignData['tSelf'] as int,
+              alignData['tCross'] as int,
+            );
+          });
+        }
 
-      // Cleanup Soloud buffer immediately to purge heap
-      if (_activeChirpSource != null) {
-        SoLoud.instance.disposeSource(_activeChirpSource!);
-        _activeChirpSource = null;
+        // Cleanup Host Soloud buffer immediately to purge heap
+        if (_activeChirpSource != null) {
+          SoLoud.instance.disposeSource(_activeChirpSource!);
+          _activeChirpSource = null;
+        }
+      } else {
+        // Guest processes self & cross correlations as usual
+        final dspArgs = BackgroundDSPArgs(
+          rawCapturedBytes: monoBuffer,
+          selfTemplate: selfChirpData,
+          crossTemplate: crossChirpData,
+        );
+
+        final dspAnalysis = await PartySyncService.runBackgroundDSPIsolate(dspArgs);
+
+        // Cleanup Soloud buffer immediately to purge heap
+        if (_activeChirpSource != null) {
+          SoLoud.instance.disposeSource(_activeChirpSource!);
+          _activeChirpSource = null;
+        }
+
+        _isAcousticSyncing = false;
+        onLogUpdate?.call("🎯 Acoustic capture completed. Peak index: ${dspAnalysis.tSelf}");
+        
+        // Send alignment consensus data to Room Coordinator
+        _sendSocketMessage('sync:alignment', {
+          'tSelf': dspAnalysis.tSelf,
+          'tCross': dspAnalysis.tCross,
+          'username': localUsername,
+        });
       }
-
+    } catch (e, st) {
+      onLogUpdate?.call("❌ Critical error inside executeDynamicAcousticSync: $e\n$st");
       _isAcousticSyncing = false;
-      onLogUpdate?.call("🎯 Acoustic capture completed. Peak index: ${dspAnalysis.tSelf}");
-      
-      // Send alignment consensus data to Room Coordinator
-      _sendSocketMessage('sync:alignment', {
-        'tSelf': dspAnalysis.tSelf,
-        'tCross': dspAnalysis.tCross,
-      });
+      onCalculationComplete?.call(0.0, 0.0, "❌ Calibration error: $e");
+      if (isHost && _syncCompleter != null && !_syncCompleter!.isCompleted) {
+        _syncCompleter!.complete();
+      }
     }
   }
 
@@ -566,20 +702,36 @@ class PartySyncService {
         onLogUpdate?.call("⚠️ Warning: Received track audioStreamUrl is empty!");
       }
 
-      if (isOfflineMode) {
-        // STRICT PLAYBACK LOCK: Only execute pre-downloaded local cached files
+      if (track.id == 'test_sound_track') {
+        final tempDir = await getTemporaryDirectory();
+        final testSoundFile = File('${tempDir.path}/test_sound_sharp_2500hz.wav');
+        onLogUpdate?.call("🔊 Checking test sound WAV at: ${testSoundFile.path}");
+        if (!await testSoundFile.exists()) {
+          onLogUpdate?.call("🔊 Synthesizing 2500Hz test sound WAV pop programmatically...");
+          final targetRate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
+          final testSoundFloats = DSPEngine.generateTestSound(targetSampleRate: targetRate);
+          final testSoundWavBytes = _packageFloatsToWav(testSoundFloats, targetRate);
+          await testSoundFile.writeAsBytes(testSoundWavBytes);
+          onLogUpdate?.call("🔊 Saved synthesized WAV test pop to disk.");
+        }
+        onLogUpdate?.call("🔊 Loading test sound file into player...");
+        await _musicPlayer.setAudioSource(ja.AudioSource.file(testSoundFile.path));
+        onLogUpdate?.call("🔊 Test sound source set successfully.");
+      } else {
+        // Cache-first high-precision local storage playback verification
         final String localPath = await _getLocalCachedPath(track.id);
         final file = File(localPath);
-        if (!await file.exists()) {
+        if (await file.exists()) {
+          onLogUpdate?.call("💾 Pre-cached hit! Playing track locally from storage: $localPath");
+          await _musicPlayer.setAudioSource(ja.AudioSource.file(localPath));
+        } else if (isOfflineMode) {
           onLogUpdate?.call("❌ Playback aborted: '${track.title}' is not pre-downloaded for offline sync!");
           return;
+        } else {
+          // Direct stream play through the proxy url
+          onLogUpdate?.call("☁️ Cache miss. Streaming remote URL: ${track.audioStreamUrl}");
+          await _musicPlayer.setAudioSource(ja.AudioSource.uri(Uri.parse(track.audioStreamUrl)));
         }
-        onLogUpdate?.call("💾 Playing local cached file offline: $localPath");
-        await _musicPlayer.setAudioSource(ja.AudioSource.file(localPath));
-      } else {
-        // Direct stream play through the proxy url
-        onLogUpdate?.call("🎵 Loading stream URL: ${track.audioStreamUrl}");
-        await _musicPlayer.setAudioSource(ja.AudioSource.uri(Uri.parse(track.audioStreamUrl)));
       }
 
       int remainingDelayMs;
@@ -617,25 +769,45 @@ class PartySyncService {
   Future<void> broadcastPlay(MediaTrack track) async {
     activeTrack = track;
 
-    if (!isOfflineMode) {
+    final guests = members.where((m) => m['userId'] != hostId).toList();
+
+    if (!isOfflineMode && guests.isNotEmpty) {
       // Clear previous acoustic sync metrics before starting the new session calibration
       _alignmentDataMap.clear();
       _hostAcousticDelay = 0;
+      _calibrationRetryCount = 0;
+      _hostCapturedMonoBuffer = null;
+      _hostTSelf = null;
       _syncCompleter = Completer<void>();
 
-      onLogUpdate?.call("⚡ Triggering rapid acoustic calibration pass...");
+      onLogUpdate?.call("⚡ Triggering rapid acoustic calibration pass with ${guests.length} guest(s)...");
+      onCalculationComplete?.call(0.0, 0.0, "⚡ Syncing: calibration in progress...");
       _sendSocketMessage('sync:trigger', {});
 
-      // Wait for consensus calculations to complete, up to a 2.5-second barrier timeout
+      // Wait for consensus calculations to complete, up to a 4.5-second barrier timeout
       await _syncCompleter!.future.timeout(
-        const Duration(milliseconds: 2500),
+        const Duration(milliseconds: 4500),
         onTimeout: () {
           onLogUpdate?.call("⚠️ Acoustic calibration consensus barrier timed out. Using current offsets.");
+          onCalculationComplete?.call(
+            0.0,
+            0.0,
+            "⚠️ Lock Timeout. Using unsynced fallback.",
+          );
         },
+      ).catchError((_) => null); // Catch timeout exception safely to ensure playback still launches
+    } else {
+      onLogUpdate?.call("📢 Playing track instantly (offline or no guests connected).");
+      _hostAcousticDelay = 0;
+      _acousticOffset = 0;
+      onCalculationComplete?.call(
+        0.0,
+        0.0,
+        "Lock: Instantly synced play",
       );
     }
 
-    final playAt = Date.nowMs() + _serverClockOffset + 1200 + _hostAcousticDelay;
+    final playAt = Date.nowMs() + _serverClockOffset + (guests.isNotEmpty ? 1200 : 200) + _hostAcousticDelay;
     
     if (isOfflineMode && _bleSyncCharacteristic != null) {
       // Offline Bluetooth BLE sync command broadcast
@@ -669,7 +841,8 @@ class PartySyncService {
     activeTrack = track;
     _hostAcousticDelay = 0;
     
-    final playAt = Date.nowMs() + _serverClockOffset + 200; // Fast start for unsynced
+    final playAt = Date.nowMs() + _serverClockOffset + 600; // 600ms safety window for unsynced
+    onLogUpdate?.call("📢 broadcastPlayUnsynced initiated. playAt: $playAt, isOfflineMode: $isOfflineMode");
     
     if (isOfflineMode && _bleSyncCharacteristic != null) {
       final Map<String, dynamic> bleFrame = {
@@ -677,10 +850,10 @@ class PartySyncService {
         'id': track.id,
         'title': track.title,
         'artist': track.artistName,
-        'delay': 200,
+        'delay': 600,
       };
       await _bleSyncCharacteristic!.write(utf8.encode(jsonEncode(bleFrame)));
-      _executeCompensatedPlayback(track, 200);
+      _executeCompensatedPlayback(track, 600);
     } else {
       _sendSocketMessage('playback:play', {
         'id': track.id,
@@ -695,6 +868,45 @@ class PartySyncService {
         'playAt': playAt,
         'isUnsynced': true,
       });
+
+      // Play locally immediately on the Host to bypass WebSocket roundtrip latency
+      onLogUpdate?.call("📢 Executing local instant unsynced playback on Host...");
+      _executeCompensatedPlayback(track, Date.nowMs() + 600);
+    }
+  }
+
+  Future<void> broadcastPlayNoNtp(MediaTrack track) async {
+    activeTrack = track;
+    _hostAcousticDelay = 0;
+    onLogUpdate?.call("📢 broadcastPlayNoNtp initiated. Firing instantly with 0ms delay.");
+    
+    if (isOfflineMode && _bleSyncCharacteristic != null) {
+      final Map<String, dynamic> bleFrame = {
+        'cmd': 'PLAY',
+        'id': track.id,
+        'title': track.title,
+        'artist': track.artistName,
+        'delay': 0,
+      };
+      await _bleSyncCharacteristic!.write(utf8.encode(jsonEncode(bleFrame)));
+      _executeCompensatedPlayback(track, 0);
+    } else {
+      _sendSocketMessage('playback:play', {
+        'id': track.id,
+        'trackId': track.id,
+        'title': track.title,
+        'artistName': track.artistName,
+        'albumTitle': track.albumTitle,
+        'coverArtUrl': track.coverArtUrl,
+        'audioStreamUrl': track.audioStreamUrl,
+        'formatBadge': track.formatBadge,
+        'durationInSeconds': track.durationInSeconds,
+        'playAt': 0,
+        'isNoNtp': true,
+      });
+
+      // Play locally immediately on the Host with 0ms delay
+      _executeCompensatedPlayback(track, 0);
     }
   }
 
@@ -723,27 +935,29 @@ class PartySyncService {
   /// Initialize continuous circular microphone stream
   Future<void> _startContinuousMicrophoneStream() async {
     if (_isMicStreaming) return;
-    if (!await _audioRecorder.hasPermission()) {
-      onLogUpdate?.call("❌ Microphone permissions rejected.");
-      return;
-    }
-
-    final int rate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
-    final int channels = Platform.isWindows ? 4 : 1;
-    const int frameSize = 2; // PCM16 bits
-    final byteFrame = channels * frameSize;
-
-    _circularBuffer = Uint8List(rate * byteFrame * 5); // 5 seconds buffer
-    _writePointer = 0;
-    _totalBytesRecorded = 0;
-
-    final config = RecordConfig(
-      encoder: AudioEncoder.pcm16bits,
-      sampleRate: rate,
-      numChannels: channels,
-    );
-
+    if (_isStartingMic) return;
+    _isStartingMic = true;
     try {
+      if (!await _audioRecorder.hasPermission()) {
+        onLogUpdate?.call("❌ Microphone permissions rejected.");
+        return;
+      }
+
+      final int rate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
+      final int channels = Platform.isWindows ? 4 : 1;
+      const int frameSize = 2; // PCM16 bits
+      final byteFrame = channels * frameSize;
+
+      _circularBuffer = Uint8List(rate * byteFrame * 5); // 5 seconds buffer
+      _writePointer = 0;
+      _totalBytesRecorded = 0;
+
+      final config = RecordConfig(
+        encoder: AudioEncoder.pcm16bits,
+        sampleRate: rate,
+        numChannels: channels,
+      );
+
       final stream = await _audioRecorder.startStream(config);
       _isMicStreaming = true;
       onLogUpdate?.call("🎙️ Mic circular buffer pipeline active (${rate}Hz).");
@@ -764,6 +978,8 @@ class PartySyncService {
       });
     } catch (e) {
       onLogUpdate?.call("❌ Mic stream initialization failed: $e");
+    } finally {
+      _isStartingMic = false;
     }
   }
 
@@ -896,8 +1112,8 @@ class PartySyncService {
 
   Future<String> _getLocalCachedPath(String trackId) async {
     final dir = await getApplicationDocumentsDirectory();
-    // Resolves file directly matching local download database specifications
-    return "${dir.path}/downloads/$trackId.mp3";
+    // Unify filename with DownloadManager exact pattern track_$trackId.mp3
+    return "${dir.path}/downloads/track_$trackId.mp3";
   }
 
   void pauseLocalPlayer() {
@@ -910,6 +1126,100 @@ class PartySyncService {
     _musicPlayer.play();
     isSongPlaying = true;
     onSongStateChanged?.call(true);
+  }
+
+  void _correlateGuestAndComputeConsensus(String userId, String username, int tSelf, int tCross) {
+    if (_hostCapturedMonoBuffer == null || _hostTSelf == null) return;
+    
+    // Calculate guest index in deterministic sorted list
+    final int guestIndex = getGuestIndex(userId);
+    
+    final double gStart = 3500.0 + (guestIndex.clamp(0, 3) * 400.0);
+    final double gEnd = 3800.0 + (guestIndex.clamp(0, 3) * 400.0);
+    final int targetRate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
+
+    onLogUpdate?.call("⚡ Correlating $username on sub-band ${gStart.round()}–${gEnd.round()}Hz (Index: $guestIndex)...");
+
+    // Run single correlation inside background isolate to avoid UI thread lag
+    final template = DSPEngine.generateChirpTemplate(
+      fStart: gStart,
+      fEnd: gEnd,
+      targetSampleRate: targetRate,
+    );
+
+    final Float32List signal = DSPEngine.convertBytesToFloat32(_hostCapturedMonoBuffer!);
+    PartySyncService.runLocatePeakIsolate(signal, template).then((tCrossPc) {
+      bool isFailure = false;
+      String missingDevice = "";
+
+      if (_hostTSelf == -1) {
+        isFailure = true;
+        missingDevice = localUsername ?? "Host";
+      } else if (tSelf == -1 || tCross == -1) {
+        isFailure = true;
+        missingDevice = username;
+      } else if (tCrossPc == -1) {
+        isFailure = true;
+        missingDevice = "Host (missed $username)";
+      }
+
+      if (isFailure) {
+        onLogUpdate?.call("⚠️ Calibration failure detected! Missing: $missingDevice");
+        onLogUpdate?.call("❌ Calibration failed. Falling back to default sync.");
+        onCalculationComplete?.call(0, 0, "❌ Calibration failed. Using 0ms fallback.");
+        
+        // Fallback: Client offset = 0, Host delay = 0
+        _hostAcousticDelay = 0;
+        _sendSocketMessage('sync:offset', {
+          'userId': userId,
+          'offsetMs': 0,
+        });
+        
+        if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
+          _syncCompleter!.complete();
+        }
+        return;
+      }
+
+      // Success case: reset retry counter
+      _calibrationRetryCount = 0;
+
+      onLogUpdate?.call("🎯 Peak located for $username: tCrossPc=$tCrossPc");
+
+      // Calculate relative delay offset using double chirps consensus
+      final double dtPhone = (tCross - tSelf) / DSPEngine.sampleRate;
+      final double dtPc = (tCrossPc - _hostTSelf!) / targetRate.toDouble();
+      final double rawMsOffset = ((dtPhone - dtPc) / 2) * 1000;
+
+      onLogUpdate?.call("🎯 Acoustic Sync consensus for $username: ${rawMsOffset.toStringAsFixed(2)} ms");
+
+      onCalculationComplete?.call(
+        rawMsOffset, 
+        rawMsOffset.abs() * 0.343, 
+        "Lock: $username delay is ${rawMsOffset.round()}ms",
+      );
+
+      if (rawMsOffset < 0) {
+        // Host is leading: Host delays itself, Client plays immediately (0 delay)
+        _hostAcousticDelay = rawMsOffset.abs().round();
+        _sendSocketMessage('sync:offset', {
+          'userId': userId,
+          'offsetMs': 0,
+        });
+      } else {
+        // Client is leading: Client delays itself, Host plays immediately (0 delay)
+        _hostAcousticDelay = 0;
+        _sendSocketMessage('sync:offset', {
+          'userId': userId,
+          'offsetMs': rawMsOffset.round(),
+        });
+      }
+
+      // Complete the sync barrier completer since consensus was computed
+      if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
+        _syncCompleter!.complete();
+      }
+    });
   }
 
   void dispose() {

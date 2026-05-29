@@ -4,6 +4,7 @@
 
 list(APPEND FLUTTER_PLUGIN_LIST
   app_links
+  flutter_ble_peripheral
   flutter_blue_plus_winrt
   record_windows
 )

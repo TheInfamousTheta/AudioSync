@@ -415,9 +415,39 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
                               ),
                             ),
                             const SizedBox(height: 12),
-                            const Text(
-                              "System Output Console Logs:", 
-                              style: TextStyle(fontFamily: 'Manrope', fontSize: 11, fontWeight: FontWeight.bold, color: AppColors.subText)
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                const Text(
+                                  "System Output Console Logs:", 
+                                  style: TextStyle(fontFamily: 'Manrope', fontSize: 11, fontWeight: FontWeight.bold, color: AppColors.subText)
+                                ),
+                                TextButton.icon(
+                                  style: TextButton.styleFrom(
+                                    padding: EdgeInsets.zero,
+                                    minimumSize: const Size(50, 30),
+                                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                    foregroundColor: AppColors.primaryNeon,
+                                  ),
+                                  onPressed: () {
+                                    final String allLogs = state.debugLogs.join('\n');
+                                    Clipboard.setData(ClipboardData(text: allLogs)).then((_) {
+                                      ScaffoldMessenger.of(context).showSnackBar(
+                                        SnackBar(
+                                          backgroundColor: AppColors.surfaceBright.withValues(alpha: 0.9),
+                                          content: const Text(
+                                            'Logs copied to clipboard!',
+                                            style: TextStyle(color: AppColors.onSurface, fontFamily: 'Manrope', fontWeight: FontWeight.bold),
+                                          ),
+                                          duration: const Duration(seconds: 1),
+                                        ),
+                                      );
+                                    });
+                                  },
+                                  icon: const Icon(Icons.copy_rounded, size: 12),
+                                  label: const Text("Copy Logs", style: TextStyle(fontFamily: 'Manrope', fontSize: 11, fontWeight: FontWeight.bold)),
+                                ),
+                              ],
                             ),
                             const SizedBox(height: 6),
                             Container(
@@ -464,6 +494,72 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
                                       : 'PLAY FIRST TRACK UNSYNCED',
                                   style: const TextStyle(fontFamily: 'Plus Jakarta Sans', fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 0.5),
                                 ),
+                              ),
+                            ],
+                            if (state.isHost) ...[
+                              const SizedBox(height: 12),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: ElevatedButton.icon(
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: AppColors.primaryNeon.withValues(alpha: 0.1),
+                                        foregroundColor: AppColors.primaryNeon,
+                                        side: const BorderSide(color: AppColors.primaryNeon, width: 1.0),
+                                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                                        padding: const EdgeInsets.symmetric(vertical: 12),
+                                      ),
+                                      onPressed: () {
+                                        context.read<PartyBloc>().add(PlayTestSoundSyncedEvent());
+                                      },
+                                      icon: const Icon(Icons.volume_up_rounded, size: 12),
+                                      label: const Text(
+                                        'SYNCED POP',
+                                        style: TextStyle(fontFamily: 'Plus Jakarta Sans', fontSize: 9, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Expanded(
+                                    child: ElevatedButton.icon(
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.orange.withValues(alpha: 0.1),
+                                        foregroundColor: Colors.orangeAccent,
+                                        side: const BorderSide(color: Colors.orangeAccent, width: 1.0),
+                                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                                        padding: const EdgeInsets.symmetric(vertical: 12),
+                                      ),
+                                      onPressed: () {
+                                        context.read<PartyBloc>().add(PlayTestSoundUnsyncedEvent());
+                                      },
+                                      icon: const Icon(Icons.flash_off_rounded, size: 12),
+                                      label: const Text(
+                                        'NTP ONLY',
+                                        style: TextStyle(fontFamily: 'Plus Jakarta Sans', fontSize: 9, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Expanded(
+                                    child: ElevatedButton.icon(
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.red.withValues(alpha: 0.1),
+                                        foregroundColor: Colors.redAccent,
+                                        side: const BorderSide(color: Colors.redAccent, width: 1.0),
+                                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                                        padding: const EdgeInsets.symmetric(vertical: 12),
+                                      ),
+                                      onPressed: () {
+                                        context.read<PartyBloc>().add(PlayTestSoundNoNtpEvent());
+                                      },
+                                      icon: const Icon(Icons.wifi_off_rounded, size: 12),
+                                      label: const Text(
+                                        'NO NTP',
+                                        style: TextStyle(fontFamily: 'Plus Jakarta Sans', fontSize: 9, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ),
                             ],
                           ],
@@ -533,7 +629,7 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
                                   children: [
                                     ClipRRect(
                                       borderRadius: BorderRadius.circular(8),
-                                      child: Image.network(track.coverArtUrl, width: 48, height: 48, fit: BoxFit.cover),
+                                      child: _buildTrackImage(track.coverArtUrl, size: 48),
                                     ),
                                     const SizedBox(width: 16),
                                     Expanded(
@@ -705,7 +801,7 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
                   return ListTile(
                     leading: ClipRRect(
                       borderRadius: BorderRadius.circular(6),
-                      child: Image.network(track.coverArtUrl, width: 36, height: 36, fit: BoxFit.cover),
+                      child: _buildTrackImage(track.coverArtUrl, size: 36),
                     ),
                     title: Text(track.title, style: const TextStyle(color: AppColors.onSurface, fontSize: 13, fontWeight: FontWeight.bold)),
                     subtitle: Text(track.artistName, style: const TextStyle(color: AppColors.subText, fontSize: 10)),
@@ -810,18 +906,7 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
                       return ListTile(
                         leading: ClipRRect(
                           borderRadius: BorderRadius.circular(6),
-                          child: Image.network(
-                            track.coverArtUrl, 
-                            width: 36, 
-                            height: 36, 
-                            fit: BoxFit.cover,
-                            errorBuilder: (context, error, stackTrace) => Container(
-                              color: Colors.white10, 
-                              width: 36, 
-                              height: 36, 
-                              child: const Icon(Icons.music_note_rounded, color: Colors.white30, size: 18),
-                            ),
-                          ),
+                          child: _buildTrackImage(track.coverArtUrl, size: 36),
                         ),
                         title: Text(track.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: AppColors.onSurface, fontSize: 13, fontWeight: FontWeight.bold)),
                         subtitle: Text(track.artistName, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: AppColors.subText, fontSize: 10)),
@@ -874,7 +959,7 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
         children: [
           ClipRRect(
             borderRadius: BorderRadius.circular(8),
-            child: Image.network(track.coverArtUrl, width: 44, height: 44, fit: BoxFit.cover),
+            child: _buildTrackImage(track.coverArtUrl, size: 44),
           ),
           const SizedBox(width: 16),
           Expanded(
@@ -917,6 +1002,28 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
           ],
         ],
       ),
+    );
+  }
+
+  Widget _buildTrackImage(String url, {double size = 48}) {
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      return Image.network(
+        url,
+        width: size,
+        height: size,
+        fit: BoxFit.cover,
+        errorBuilder: (context, error, stackTrace) => _buildFallbackImage(size),
+      );
+    }
+    return _buildFallbackImage(size);
+  }
+
+  Widget _buildFallbackImage(double size) {
+    return Container(
+      color: Colors.white10,
+      width: size,
+      height: size,
+      child: Icon(Icons.music_note_rounded, color: Colors.white30, size: size * 0.5),
     );
   }
 }
