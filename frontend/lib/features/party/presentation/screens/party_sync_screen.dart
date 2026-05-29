@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:flutter/foundation.dart';
 import 'package:audio_sync/core/theme/app_colors.dart';
 import 'package:audio_sync/core/theme/app_gradients.dart';
 import 'package:audio_sync/core/widgets/glass_container.dart';
@@ -124,7 +125,7 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
                     onPressed: () {
                       final authState = context.read<AuthBloc>().state;
                       if (authState is AuthAuthenticatedState) {
-                        context.read<PartyBloc>().add(CreatePartyEvent(authState.token));
+                        context.read<PartyBloc>().add(CreatePartyEvent(authState.token, username: authState.username));
                       }
                     },
                     child: const Text(
@@ -193,7 +194,7 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
 
                         final authState = context.read<AuthBloc>().state;
                         if (authState is AuthAuthenticatedState) {
-                          context.read<PartyBloc>().add(JoinPartyRoomEvent(partyId: code, token: authState.token));
+                          context.read<PartyBloc>().add(JoinPartyRoomEvent(partyId: code, token: authState.token, username: authState.username));
                         }
                       }
                     },
@@ -349,6 +350,111 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
           ),
         ),
 
+        if (kDebugMode)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 8.0),
+            child: GlassContainer(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.bug_report_rounded, color: AppColors.primaryNeon, size: 18),
+                      const SizedBox(width: 8),
+                      const Text(
+                        'DEBUG MATRIX & OUTPUT CONSOLE',
+                        style: TextStyle(
+                          fontFamily: 'Manrope',
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          color: AppColors.primaryNeon,
+                          letterSpacing: 1.0,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  // Calibration Status Card
+                  Container(
+                    padding: const EdgeInsets.all(12.0),
+                    decoration: BoxDecoration(
+                      color: AppColors.containerLow,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.white10),
+                    ),
+                    child: Text(
+                      state.debugResult,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: state.debugResult.contains('❌') 
+                            ? Colors.redAccent 
+                            : state.debugResult.contains('Lock') 
+                                ? AppColors.primaryNeon 
+                                : Colors.amberAccent,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    "System Output Console Logs:", 
+                    style: TextStyle(fontFamily: 'Manrope', fontSize: 11, fontWeight: FontWeight.bold, color: AppColors.subText)
+                  ),
+                  const SizedBox(height: 6),
+                  Container(
+                    height: 120,
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.6),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.white10),
+                    ),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(12),
+                      child: ListView.builder(
+                        physics: const BouncingScrollPhysics(),
+                        padding: const EdgeInsets.all(12),
+                        itemCount: state.debugLogs.length,
+                        itemBuilder: (context, index) => Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 2.0),
+                          child: Text(
+                            state.debugLogs[index],
+                            style: const TextStyle(fontFamily: 'monospace', fontSize: 11, color: Colors.white70),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (state.playlist.isNotEmpty && state.isHost) ...[
+                    const SizedBox(height: 12),
+                    ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.orange.withValues(alpha: 0.1),
+                        foregroundColor: Colors.orangeAccent,
+                        side: const BorderSide(color: Colors.orangeAccent, width: 1.0),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                      ),
+                      onPressed: () {
+                        final trackToPlay = state.activeTrack ?? state.playlist.first;
+                        context.read<PartyBloc>().add(PlayTrackUnsyncedEvent(trackToPlay));
+                      },
+                      icon: const Icon(Icons.flash_off_rounded, size: 16),
+                      label: Text(
+                        state.activeTrack != null 
+                            ? 'FORCE PLAY UNSYNCED ("${state.activeTrack!.title}")' 
+                            : 'PLAY FIRST TRACK UNSYNCED',
+                        style: const TextStyle(fontFamily: 'Plus Jakarta Sans', fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+
         // Collaborative Playlist Queue Title
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 24.0),
@@ -378,81 +484,100 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
 
         // Playlist Queue
         Expanded(
-          child: state.playlist.isEmpty
-              ? _buildEmptyQueueView(state)
-              : ListView.builder(
-                  physics: const BouncingScrollPhysics(),
-                  padding: const EdgeInsets.symmetric(horizontal: 24.0),
-                  itemCount: state.playlist.length,
-                  itemBuilder: (context, index) {
-                    final track = state.playlist[index];
-                    final isCurrentTrack = state.activeTrack?.id == track.id;
-                    
-                    // Host can remove any; Member can only remove their own added tracks
-                    final canDelete = state.isHost || !state.isOffline; // Strict rules applied inside bloc
+          child: RefreshIndicator(
+            color: AppColors.primaryNeon,
+            backgroundColor: AppColors.containerLow,
+            onRefresh: () async {
+              context.read<PartyBloc>().add(LoadPartyDetailsEvent(partyId: state.partyId, token: ""));
+              await Future.delayed(const Duration(milliseconds: 600));
+            },
+            child: state.playlist.isEmpty
+                ? SingleChildScrollView(
+                    physics: const AlwaysScrollableScrollPhysics(parent: BouncingScrollPhysics()),
+                    child: SizedBox(
+                      height: 400,
+                      child: _buildEmptyQueueView(state),
+                    ),
+                  )
+                : ListView.builder(
+                    physics: const AlwaysScrollableScrollPhysics(parent: BouncingScrollPhysics()),
+                    padding: const EdgeInsets.symmetric(horizontal: 24.0),
+                    itemCount: state.playlist.length,
+                    itemBuilder: (context, index) {
+                      final track = state.playlist[index];
+                      final isCurrentTrack = state.activeTrack?.id == track.id;
+                      
+                      // Host can remove any; Member can only remove their own added tracks
+                      final canDelete = state.isHost || !state.isOffline; // Strict rules applied inside bloc
 
-                    return Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 8.0),
-                      child: Container(
-                        padding: const EdgeInsets.all(12.0),
-                        decoration: BoxDecoration(
-                          color: isCurrentTrack 
-                              ? AppColors.surfaceBright.withValues(alpha: 0.5) 
-                              : AppColors.surfaceContainerLow.withValues(alpha: 0.5),
-                          borderRadius: BorderRadius.circular(16.0),
-                          border: Border.all(
-                            color: isCurrentTrack ? AppColors.primaryNeon.withValues(alpha: 0.3) : AppColors.ghostBorder,
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8.0),
+                        child: Container(
+                          padding: const EdgeInsets.all(12.0),
+                          decoration: BoxDecoration(
+                            color: isCurrentTrack 
+                                ? AppColors.surfaceBright.withValues(alpha: 0.5) 
+                                : AppColors.surfaceContainerLow.withValues(alpha: 0.5),
+                            borderRadius: BorderRadius.circular(16.0),
+                            border: Border.all(
+                              color: isCurrentTrack ? AppColors.primaryNeon.withValues(alpha: 0.3) : AppColors.ghostBorder,
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.network(track.coverArtUrl, width: 48, height: 48, fit: BoxFit.cover),
+                              ),
+                              const SizedBox(width: 16),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      track.title,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(fontWeight: FontWeight.bold, color: AppColors.onSurface, fontSize: 14),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      track.artistName,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(color: AppColors.subText, fontSize: 11),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              if (isCurrentTrack && state.isPlaying)
+                                IconButton(
+                                  icon: const Icon(Icons.pause_rounded, color: AppColors.primaryNeon),
+                                  onPressed: () {
+                                    context.read<PartyBloc>().add(TogglePartyPlayStateEvent());
+                                  },
+                                )
+                              else if (state.isHost)
+                                IconButton(
+                                  icon: const Icon(Icons.play_arrow_rounded, color: AppColors.primaryNeon),
+                                  onPressed: () {
+                                    context.read<PartyBloc>().add(PlayTrackSyncedEvent(track));
+                                  },
+                                ),
+                              if (canDelete)
+                                IconButton(
+                                  icon: const Icon(Icons.delete_outline_rounded, color: Colors.white38),
+                                  onPressed: () {
+                                    context.read<PartyBloc>().add(RemoveTrackFromPartyQueueEvent(track.id));
+                                  },
+                                ),
+                            ],
                           ),
                         ),
-                        child: Row(
-                          children: [
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(8),
-                              child: Image.network(track.coverArtUrl, width: 48, height: 48, fit: BoxFit.cover),
-                            ),
-                            const SizedBox(width: 16),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    track.title,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(fontWeight: FontWeight.bold, color: AppColors.onSurface, fontSize: 14),
-                                  ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    track.artistName,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(color: AppColors.subText, fontSize: 11),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            if (isCurrentTrack && state.isPlaying)
-                              const Icon(Icons.volume_up_rounded, color: AppColors.primaryNeon, size: 20)
-                            else if (state.isHost)
-                              IconButton(
-                                icon: const Icon(Icons.play_arrow_rounded, color: AppColors.primaryNeon),
-                                onPressed: () {
-                                  context.read<PartyBloc>().add(PlayTrackSyncedEvent(track));
-                                },
-                              ),
-                            if (canDelete)
-                              IconButton(
-                                icon: const Icon(Icons.delete_outline_rounded, color: Colors.white38),
-                                onPressed: () {
-                                  context.read<PartyBloc>().add(RemoveTrackFromPartyQueueEvent(track.id));
-                                },
-                              ),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
+                      );
+                    },
+                  ),
+          ),
         ),
 
         // Synced Bottom Player Bar Controller
@@ -685,24 +810,24 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
               ],
             ),
           ),
-          if (state.isHost)
-            IconButton(
-              icon: Icon(
-                state.isPlaying ? Icons.pause_circle_filled_rounded : Icons.play_circle_filled_rounded,
-                color: AppColors.primaryNeon,
-                size: 36,
-              ),
-              onPressed: () {
-                context.read<PartyBloc>().add(TogglePartyPlayStateEvent());
-              },
-            )
-          else
-            // Members see passive synchronizing icon
+          IconButton(
+            icon: Icon(
+              state.isPlaying ? Icons.pause_circle_filled_rounded : Icons.play_circle_filled_rounded,
+              color: AppColors.primaryNeon,
+              size: 36,
+            ),
+            onPressed: () {
+              context.read<PartyBloc>().add(TogglePartyPlayStateEvent());
+            },
+          ),
+          if (!state.isHost) ...[
+            const SizedBox(width: 8),
             Icon(
               state.isPlaying ? Icons.sync_rounded : Icons.sync_disabled_rounded,
               color: state.isPlaying ? AppColors.primaryNeon : AppColors.subText,
-              size: 28,
+              size: 20,
             ),
+          ],
         ],
       ),
     );

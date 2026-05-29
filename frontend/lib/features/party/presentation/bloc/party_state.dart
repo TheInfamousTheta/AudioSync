@@ -22,6 +22,9 @@ class PartyJoinedState extends PartyState {
   final bool isPlaying;
   final bool isHost;
   final bool isOffline;
+  final String sessionToken;
+  final List<String> debugLogs;
+  final String debugResult;
 
   PartyJoinedState({
     required this.partyId,
@@ -33,6 +36,9 @@ class PartyJoinedState extends PartyState {
     this.isPlaying = false,
     required this.isHost,
     this.isOffline = false,
+    this.sessionToken = '',
+    this.debugLogs = const [],
+    this.debugResult = 'Standing by for synchronization...',
   });
 
   PartyJoinedState copyWith({
@@ -45,6 +51,9 @@ class PartyJoinedState extends PartyState {
     bool? isPlaying,
     bool? isHost,
     bool? isOffline,
+    String? sessionToken,
+    List<String>? debugLogs,
+    String? debugResult,
   }) {
     return PartyJoinedState(
       partyId: partyId ?? this.partyId,
@@ -56,6 +65,9 @@ class PartyJoinedState extends PartyState {
       isPlaying: isPlaying ?? this.isPlaying,
       isHost: isHost ?? this.isHost,
       isOffline: isOffline ?? this.isOffline,
+      sessionToken: sessionToken ?? this.sessionToken,
+      debugLogs: debugLogs ?? this.debugLogs,
+      debugResult: debugResult ?? this.debugResult,
     );
   }
 }

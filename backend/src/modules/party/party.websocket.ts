@@ -129,18 +129,45 @@ function handleSocketMessage(ws: WebSocket, payload: { event: string; data: any 
       break;
     }
 
+    case 'sync:alignment': {
+      if (meta.partyId) {
+        console.log(`[WS] Alignment data received from "${meta.username}" in party room: ${meta.partyId}`);
+        broadcastToRoom(meta.partyId, 'sync:alignment', {
+          userId: meta.userId,
+          username: meta.username,
+          tSelf: data.tSelf,
+          tCross: data.tCross,
+        });
+      }
+      break;
+    }
+
+    case 'sync:offset': {
+      if (meta.partyId) {
+        console.log(`[WS] Delay offset instruction received for "${data.userId}": ${data.offsetMs}ms`);
+        broadcastToRoom(meta.partyId, 'sync:offset', {
+          userId: data.userId,
+          offsetMs: data.offsetMs,
+        });
+      }
+      break;
+    }
+
     case 'playback:play': {
       if (meta.partyId) {
-        const { trackId, title, audioStreamUrl, coverArtUrl, artistName, albumTitle, playAt } = data;
+        const { id, trackId, title, audioStreamUrl, coverArtUrl, artistName, albumTitle, playAt, isUnsynced } = data;
+        const actualTrackId = id || trackId;
         console.log(`[WS] Directing synchronized playback: "${title}" in party room: ${meta.partyId}. Target Start Time: ${playAt}`);
         broadcastToRoom(meta.partyId, 'playback:play', {
-          trackId,
+          id: actualTrackId,
+          trackId: actualTrackId,
           title,
           audioStreamUrl,
           coverArtUrl,
           artistName,
           albumTitle,
           playAt: playAt || (Date.now() + 1000), // Default to start in 1 second if not specified
+          isUnsynced: isUnsynced === true,
           directedBy: meta.userId,
         });
       }

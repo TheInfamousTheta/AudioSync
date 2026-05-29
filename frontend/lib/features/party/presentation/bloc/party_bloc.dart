@@ -15,6 +15,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
   StreamSubscription? _songSubscription;
   StreamSubscription? _trackSubscription;
   String? _sessionToken;
+  Timer? _refreshTimer;
 
   Future<String> _retrieveToken() async {
     if (_sessionToken != null && _sessionToken!.isNotEmpty) {
@@ -47,8 +48,12 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
     
     // Wire the underlying high-fidelity synchronization engine listeners
     _syncService.onLogUpdate = (log) {
-      // Direct stream to console or local system log
       print("[SYNC-CORE] $log");
+      add(UpdatePartyDebugInfoEvent(log: log));
+    };
+
+    _syncService.onCalculationComplete = (offsetMs, distanceMeters, statusText) {
+      add(UpdatePartyDebugInfoEvent(debugResult: statusText));
     };
 
     _syncService.onSongStateChanged = (isPlaying) {
@@ -56,7 +61,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       if (currentState is PartyJoinedState) {
         add(UpdatePartyDetailsEvent(
           partyId: currentState.partyId,
-          token: "", // Handled inside state retention
+          token: "",
           isPlayStateChangeOnly: true,
           isPlaying: isPlaying,
         ));
@@ -76,6 +81,17 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       }
     };
 
+    _syncService.onPlaylistUpdated = () {
+      final currentState = state;
+      if (currentState is PartyJoinedState) {
+        add(LoadPartyDetailsEvent(
+          partyId: currentState.partyId,
+          token: currentState.sessionToken,
+        ));
+      }
+    };
+
+
     on<CreatePartyEvent>((event, emit) async {
       emit(PartyLoadingState());
       try {
@@ -88,6 +104,8 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
         _sessionToken = event.token;
 
         await _syncService.initialize();
+        _syncService.localUsername = event.username;
+        _syncService.isHost = true;
         await _syncService.connectWebSocket(partyId, event.token);
 
         final details = await _apiClient.fetchPartyDetails(partyId, event.token);
@@ -105,7 +123,11 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           isOffline: false,
           isPlaying: _syncService.isSongPlaying,
           activeTrack: _syncService.activeTrack,
+          sessionToken: event.token,
         ));
+
+        // 30s periodic fallback refresh in case WS events are missed
+        _startPeriodicRefresh(partyId, event.token);
       } catch (e) {
         emit(PartyFailureState(e.toString().replaceAll('Exception: ', '')));
       }
@@ -140,6 +162,8 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
 
         // 3. Connect WebSocket using UUID
         await _syncService.initialize();
+        _syncService.localUsername = event.username;
+        _syncService.isHost = false;
         await _syncService.connectWebSocket(actualPartyId, event.token);
 
         // 4. Fetch details using UUID
@@ -158,7 +182,11 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           isOffline: false,
           isPlaying: _syncService.isSongPlaying,
           activeTrack: _syncService.activeTrack,
+          sessionToken: event.token,
         ));
+
+        // 30s periodic fallback refresh
+        _startPeriodicRefresh(actualPartyId, event.token);
       } catch (e) {
         emit(PartyFailureState(e.toString().replaceAll('Exception: ', '')));
       }
@@ -177,7 +205,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       }
 
       try {
-        final tokenToUse = event.token.isNotEmpty ? event.token : await _retrieveToken();
+        final tokenToUse = event.token.isNotEmpty ? event.token : currentState.sessionToken;
         final details = await _apiClient.fetchPartyDetails(currentState.partyId, tokenToUse);
         final members = details['members'] as List<dynamic>;
         final playlistJson = details['playlist'] as List<dynamic>;
@@ -188,7 +216,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           playlist: playlist,
         ));
       } catch (_) {
-        // Fallback to preserve active list if details call experiences network hiccups
+        // Fallback: preserve active list on network hiccup
       }
     });
 
@@ -206,16 +234,14 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       }
 
       try {
-        // Resolve streaming URL on-the-fly if not present (true for search results)
         String streamUrl = event.track.audioStreamUrl;
         if (streamUrl.isEmpty) {
           final metadata = await _apiClient.fetchTrackMetadata(event.track.id);
           streamUrl = metadata['audioStreamUrl'] as String? ?? "";
         }
 
-        final token = await _retrieveToken();
+        final token = currentState.sessionToken;
 
-        // Appends to database collaborative playlist
         await _apiClient.addTrackToPartyPlaylist(
           currentState.partyId,
           {
@@ -229,9 +255,9 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           },
           token,
         );
-        
-        // Push reload notice over WebSocket
-        _syncService.broadcastPause(); // Broadcast update triggers immediate room reload
+
+        // Notify peers via playlist:update WS (no pause side-effect)
+        _syncService.broadcastPlaylistUpdate();
         add(LoadPartyDetailsEvent(partyId: currentState.partyId, token: token));
       } catch (e) {
         print("[BLOC] Failed to append track to collaborative queue: $e");
@@ -252,7 +278,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       }
 
       try {
-        final token = await _retrieveToken();
+        final token = currentState.sessionToken;
         await _apiClient.removeTrackFromPartyPlaylist(currentState.partyId, event.queueId, token);
         add(LoadPartyDetailsEvent(partyId: currentState.partyId, token: token));
       } catch (e) {
@@ -271,10 +297,66 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       if (currentState is! PartyJoinedState) return;
 
       try {
-        await _syncService.broadcastPlay(event.track);
-        emit(currentState.copyWith(isPlaying: true, activeTrack: event.track));
+        MediaTrack track = event.track;
+        if (track.audioStreamUrl.isEmpty) {
+          final playlistTrack = currentState.playlist.firstWhere(
+            (t) => t.id == track.id,
+            orElse: () => track,
+          );
+          track = playlistTrack;
+        }
+        if (track.audioStreamUrl.isEmpty) {
+          final metadata = await _apiClient.fetchTrackMetadata(track.id);
+          final streamUrl = metadata['audioStreamUrl'] as String? ?? "";
+          track = MediaTrack(
+            id: track.id,
+            title: track.title,
+            artistName: track.artistName,
+            albumTitle: track.albumTitle,
+            coverArtUrl: track.coverArtUrl,
+            audioStreamUrl: streamUrl,
+            formatBadge: track.formatBadge,
+            durationInSeconds: track.durationInSeconds,
+          );
+        }
+        await _syncService.broadcastPlay(track);
+        emit(currentState.copyWith(isPlaying: true, activeTrack: track));
       } catch (e) {
         print("[BLOC] Synced track broadcast playback failed: $e");
+      }
+    });
+
+    on<PlayTrackUnsyncedEvent>((event, emit) async {
+      final currentState = state;
+      if (currentState is! PartyJoinedState) return;
+
+      try {
+        MediaTrack track = event.track;
+        if (track.audioStreamUrl.isEmpty) {
+          final playlistTrack = currentState.playlist.firstWhere(
+            (t) => t.id == track.id,
+            orElse: () => track,
+          );
+          track = playlistTrack;
+        }
+        if (track.audioStreamUrl.isEmpty) {
+          final metadata = await _apiClient.fetchTrackMetadata(track.id);
+          final streamUrl = metadata['audioStreamUrl'] as String? ?? "";
+          track = MediaTrack(
+            id: track.id,
+            title: track.title,
+            artistName: track.artistName,
+            albumTitle: track.albumTitle,
+            coverArtUrl: track.coverArtUrl,
+            audioStreamUrl: streamUrl,
+            formatBadge: track.formatBadge,
+            durationInSeconds: track.durationInSeconds,
+          );
+        }
+        await _syncService.broadcastPlayUnsynced(track);
+        emit(currentState.copyWith(isPlaying: true, activeTrack: track));
+      } catch (e) {
+        print("[BLOC] Unsynced track broadcast playback failed: $e");
       }
     });
 
@@ -283,12 +365,22 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       if (currentState is! PartyJoinedState) return;
 
       try {
-        if (_syncService.isSongPlaying) {
-          await _syncService.broadcastPause();
-          emit(currentState.copyWith(isPlaying: false));
-        } else if (currentState.activeTrack != null) {
-          await _syncService.broadcastPlay(currentState.activeTrack!);
-          emit(currentState.copyWith(isPlaying: true));
+        if (currentState.isHost) {
+          if (currentState.isPlaying) {
+            await _syncService.broadcastPause();
+            emit(currentState.copyWith(isPlaying: false));
+          } else if (currentState.activeTrack != null) {
+            await _syncService.broadcastPlay(currentState.activeTrack!);
+            emit(currentState.copyWith(isPlaying: true));
+          }
+        } else {
+          if (currentState.isPlaying) {
+            _syncService.pauseLocalPlayer();
+            emit(currentState.copyWith(isPlaying: false));
+          } else if (currentState.activeTrack != null) {
+            _syncService.resumeLocalPlayer();
+            emit(currentState.copyWith(isPlaying: true));
+          }
         }
       } catch (e) {
         print("[BLOC] Playback state toggle failed: $e");
@@ -325,9 +417,41 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       }
     });
 
+    on<UpdatePartyDebugInfoEvent>((event, emit) {
+      final currentState = state;
+      if (currentState is PartyJoinedState) {
+        List<String> newLogs = currentState.debugLogs;
+        if (event.log != null) {
+          newLogs = List<String>.from(currentState.debugLogs)
+            ..insert(0, "[${DateTime.now().toString().substring(11, 19)}] ${event.log}");
+          if (newLogs.length > 100) {
+            newLogs = newLogs.sublist(0, 100);
+          }
+        }
+        emit(currentState.copyWith(
+          debugLogs: newLogs,
+          debugResult: event.debugResult ?? currentState.debugResult,
+        ));
+      }
+    });
+
     on<DisconnectPartyEvent>((event, emit) async {
+      _refreshTimer?.cancel();
+      _syncService.stopAudio();
       await _syncService.disconnect();
       emit(PartyInitialState());
+    });
+  }
+
+  void _startPeriodicRefresh(String partyId, String token) {
+    _refreshTimer?.cancel();
+    _refreshTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      final currentState = state;
+      if (currentState is PartyJoinedState) {
+        add(LoadPartyDetailsEvent(partyId: partyId, token: token));
+      } else {
+        _refreshTimer?.cancel();
+      }
     });
   }
 
@@ -336,6 +460,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
     _logSubscription?.cancel();
     _songSubscription?.cancel();
     _trackSubscription?.cancel();
+    _refreshTimer?.cancel();
     _syncService.dispose();
     return super.close();
   }

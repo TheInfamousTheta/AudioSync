@@ -23,7 +23,7 @@ class MediaTrack {
 
   factory MediaTrack.fromJson(Map<String, dynamic> json) {
     return MediaTrack(
-      id: json['id'] ?? '',
+      id: json['id'] ?? json['trackId'] ?? '',
       title: json['title'] ?? '',
       artistName: json['artistName'] ?? '',
       albumTitle: json['albumTitle'] ?? 'Midnight City Sessions',

@@ -4,7 +4,8 @@ abstract class PartyEvent {}
 
 class CreatePartyEvent extends PartyEvent {
   final String token;
-  CreatePartyEvent(this.token);
+  final String username;
+  CreatePartyEvent(this.token, {this.username = ""});
 }
 
 class ResolveInviteCodeEvent extends PartyEvent {
@@ -16,7 +17,8 @@ class ResolveInviteCodeEvent extends PartyEvent {
 class JoinPartyRoomEvent extends PartyEvent {
   final String partyId;
   final String token;
-  JoinPartyRoomEvent({required this.partyId, required this.token});
+  final String username;
+  JoinPartyRoomEvent({required this.partyId, required this.token, this.username = ""});
 }
 
 class LoadPartyDetailsEvent extends PartyEvent {
@@ -54,3 +56,14 @@ class EnterOfflineSyncModeEvent extends PartyEvent {
 }
 
 class DisconnectPartyEvent extends PartyEvent {}
+
+class UpdatePartyDebugInfoEvent extends PartyEvent {
+  final String? log;
+  final String? debugResult;
+  UpdatePartyDebugInfoEvent({this.log, this.debugResult});
+}
+
+class PlayTrackUnsyncedEvent extends PartyEvent {
+  final MediaTrack track;
+  PlayTrackUnsyncedEvent(this.track);
+}
