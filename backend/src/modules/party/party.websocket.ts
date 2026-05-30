@@ -147,6 +147,7 @@ function handleSocketMessage(ws: WebSocket, payload: { event: string; data: any 
         console.log(`[WS] Delay offset instruction received for "${data.userId}": ${data.offsetMs}ms`);
         broadcastToRoom(meta.partyId, 'sync:offset', {
           userId: data.userId,
+          username: data.username,
           offsetMs: data.offsetMs,
         });
       }
