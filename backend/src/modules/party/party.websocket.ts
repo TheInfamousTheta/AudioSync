@@ -124,6 +124,7 @@ function handleSocketMessage(ws: WebSocket, payload: { event: string; data: any 
         broadcastToRoom(meta.partyId, 'sync:trigger', {
           triggeredBy: meta.userId,
           serverTimestamp: Date.now(),
+          ...data,
         });
       }
       break;
