@@ -431,8 +431,9 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
                                   ),
                                   onPressed: () {
                                     final String allLogs = state.debugLogs.join('\n');
+                                    final messenger = ScaffoldMessenger.of(context);
                                     Clipboard.setData(ClipboardData(text: allLogs)).then((_) {
-                                      ScaffoldMessenger.of(context).showSnackBar(
+                                      messenger.showSnackBar(
                                         SnackBar(
                                           backgroundColor: AppColors.surfaceBright.withValues(alpha: 0.9),
                                           content: const Text(

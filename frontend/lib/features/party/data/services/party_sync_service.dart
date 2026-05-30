@@ -631,7 +631,6 @@ class PartySyncService {
       onLogUpdate?.call("⚡ Generating dynamic calibration chirps...");
 
       final int targetRate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
-      final bool isPC = Platform.isWindows;
 
       // Allocate dynamic sub-band based on Host/Client FDMA roles
       Float32List selfChirpData;
@@ -743,7 +742,7 @@ class PartySyncService {
       }
 
       // Acoustic timeline capture (using snapshotStartMarker captured before chirp emission)
-      final int targetLength = (targetRate * 0.8 * (Platform.isWindows ? 8 : 2)).toInt(); // channels * 2 bytes
+      final int targetLength = (targetRate * 0.8 * 2).toInt(); // 1 channel * 2 bytes
       final Uint8List capturedBuffer = Uint8List(targetLength);
 
       // Await 800ms recording snapshot
@@ -765,11 +764,7 @@ class PartySyncService {
         capturedBuffer.setRange(part1, targetLength, _circularBuffer, 0);
       }
 
-      // Process mono conversion if multichannel (Windows microphone inputs)
       Uint8List monoBuffer = capturedBuffer;
-      if (isPC) {
-        monoBuffer = _extractMonoFromMultichannel(capturedBuffer, 4);
-      }
 
       if (isHost) {
         // Host saves captured monoBuffer to correlate guest chirps on demand
@@ -1113,8 +1108,26 @@ class PartySyncService {
         return;
       }
 
+      InputDevice? selectedDevice;
+      try {
+        final devices = await _audioRecorder.listInputDevices();
+        onLogUpdate?.call("🎙️ [Mic Diagnostic] Available Input Devices:");
+        for (final d in devices) {
+          onLogUpdate?.call("  - [ID: ${d.id}] Name: ${d.label}");
+          if (Platform.isWindows && selectedDevice == null) {
+            final labelLower = d.label.toLowerCase();
+            if (labelLower.contains("microphone array") || labelLower.contains("smart sound") || labelLower.contains("realtek")) {
+              selectedDevice = d;
+              onLogUpdate?.call("🎯 Auto-selected physical microphone device: ${d.label}");
+            }
+          }
+        }
+      } catch (e) {
+        onLogUpdate?.call("⚠️ Could not list capture devices: $e");
+      }
+
       final int rate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
-      final int channels = Platform.isWindows ? 4 : 1;
+      final int channels = 1;
       const int frameSize = 2; // PCM16 bits
       final byteFrame = channels * frameSize;
 
@@ -1129,6 +1142,7 @@ class PartySyncService {
         autoGain: false,
         echoCancel: false,
         noiseSuppress: false,
+        device: selectedDevice,
       );
 
       final stream = await _audioRecorder.startStream(config);
@@ -1221,20 +1235,7 @@ class PartySyncService {
     return wav;
   }
 
-  Uint8List _extractMonoFromMultichannel(Uint8List multiBytes, int totalChannels) {
-    const int frameSize = 2; // PCM16
-    final int rawFrame = totalChannels * frameSize;
-    final int totalFrames = multiBytes.length ~/ rawFrame;
-    final mono = Uint8List(totalFrames * frameSize);
 
-    int monoOffset = 0;
-    for (int i = 0; i < totalFrames * rawFrame; i += rawFrame) {
-      mono[monoOffset] = multiBytes[i];
-      mono[monoOffset + 1] = multiBytes[i + 1];
-      monoOffset += frameSize;
-    }
-    return mono;
-  }
 
   Future<String> _getLocalCachedPath(String trackId) async {
     final dir = await getApplicationDocumentsDirectory();
