@@ -581,11 +581,11 @@ class PartySyncService {
       }
 
       // Acoustic timeline capture (using snapshotStartMarker captured before chirp emission)
-      final int targetLength = (targetRate * 1.5 * (Platform.isWindows ? 8 : 2)).toInt(); // channels * 2 bytes
+      final int targetLength = (targetRate * 0.8 * (Platform.isWindows ? 8 : 2)).toInt(); // channels * 2 bytes
       final Uint8List capturedBuffer = Uint8List(targetLength);
 
-      // Await 1.5s recording snapshot
-      await Future.delayed(const Duration(milliseconds: 1500));
+      // Await 800ms recording snapshot
+      await Future.delayed(const Duration(milliseconds: 800));
 
       // Stop player to clear playing state
       try {
@@ -814,7 +814,7 @@ class PartySyncService {
     }
 
     final int schedulingWindow = track.id == 'test_sound_track'
-        ? (guests.isNotEmpty ? 1200 : 200)
+        ? (guests.isNotEmpty ? 400 : 200)
         : (guests.isNotEmpty ? 2500 : 600); // 2500ms for real remote song tracks to ensure robust buffering!
 
     final playAt = Date.nowMs() + _serverClockOffset + schedulingWindow;

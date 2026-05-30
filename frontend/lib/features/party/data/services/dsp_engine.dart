@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'fft_engine.dart';
 
 /// Parameter wrapper used to pass unified payloads to the background Isolate task runner thread
 class BackgroundDSPArgs {
@@ -56,8 +57,7 @@ class DSPEngine {
     return BackgroundDSPResult(tSelf: tSelf, tCross: tCross);
   }
 
-  /// Highly robust cross-correlation peak scan engine using a First-Arrival Detector.
-  /// Safely rejects late multipath reflections and suppresses hardware processing latency variations.
+  /// Highly robust cross-correlation peak scan engine using FFT frequency-domain math.
   static int locatePeakIndex(Float32List recording, Float32List template) {
     final int recLength = recording.length;
     final int tempLength = template.length;
@@ -65,29 +65,46 @@ class DSPEngine {
     
     if (searchWindowLength <= 0) return -1;
 
-    // Track cross-correlation scores across the entire window
+    final int fftLen = FFTEngine.nextPowerOf2(recLength);
+
+    final Float64List signalReal = Float64List(fftLen);
+    final Float64List signalImag = Float64List(fftLen);
+    final Float64List templateReal = Float64List(fftLen);
+    final Float64List templateImag = Float64List(fftLen);
+
+    for (int i = 0; i < recLength; i++) {
+      signalReal[i] = recording[i].toDouble();
+    }
+    for (int i = 0; i < tempLength; i++) {
+      templateReal[i] = template[i].toDouble();
+    }
+
+    FFTEngine.transform(signalReal, signalImag, inverse: false);
+    FFTEngine.transform(templateReal, templateImag, inverse: false);
+
+    final Float64List outReal = Float64List(fftLen);
+    final Float64List outImag = Float64List(fftLen);
+    FFTEngine.complexMultiplyConjugate(
+      signalReal,
+      signalImag,
+      templateReal,
+      templateImag,
+      outReal,
+      outImag,
+    );
+
+    FFTEngine.transform(outReal, outImag, inverse: true);
+
     final Float32List scores = Float32List(searchWindowLength + 1);
     double globalMax = 0.0;
     double sumScores = 0.0;
 
-    // PERFORMANCE OPTIMIZATION: Local references prevent array boundary/property 
-    // lookup overhead checks on every single nested loop iteration cycle.
-    final Float32List localRec = recording;
-    final Float32List localTemp = template;
-
     for (int i = 0; i <= searchWindowLength; i++) {
-      double currentSum = 0.0;
-      
-      for (int j = 0; j < tempLength; j++) {
-        currentSum += localRec[i + j] * localTemp[j];
-      }
-      
-      double absScore = currentSum.abs();
-      scores[i] = absScore;
-      sumScores += absScore;
-
-      if (absScore > globalMax) {
-        globalMax = absScore;
+      double score = outReal[i].abs();
+      scores[i] = score;
+      sumScores += score;
+      if (score > globalMax) {
+        globalMax = score;
       }
     }
 
