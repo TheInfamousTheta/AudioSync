@@ -33,7 +33,9 @@ class PartySyncService {
   int _roundTripTime = 0;
   Timer? _ntpTimer;
   bool _isNtpSuspended = false;
+  bool _isReconnecting = false;
   final List<int> _rttHistory = [];
+  int _acceptedPingCount = 0;
 
   // Circular audio recording buffer
   StreamSubscription<List<int>>? _recorderSubscription;
@@ -52,6 +54,7 @@ class PartySyncService {
   AudioSource? _activeChirpSource;
   AudioSource? _activeSoLoudSource;
   AudioSource? _preloadedTestSoundSource;
+  AudioSource? _preloadedSoLoudChirpSource;
   
   bool _isPreloadingChirp = false;
   bool _isStartingMic = false;
@@ -142,6 +145,45 @@ class PartySyncService {
     }
   }
 
+  Future<void> preloadSoLoudChirp() async {
+    try {
+      final int targetRate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
+      Float32List selfChirpData;
+      if (isHost) {
+        selfChirpData = DSPEngine.generateChirpTemplate(
+          fStart: 1000.0,
+          fEnd: 2000.0,
+          targetSampleRate: targetRate,
+        );
+      } else {
+        final int guestIndex = getMyGuestIndex();
+        final double cStart = 2200.0 + (guestIndex.clamp(0, 3) * 450.0);
+        final double cEnd = 2500.0 + (guestIndex.clamp(0, 3) * 450.0);
+        selfChirpData = DSPEngine.generateChirpTemplate(
+          fStart: cStart,
+          fEnd: cEnd,
+          targetSampleRate: targetRate,
+        );
+      }
+      final Uint8List wavBytes = _packageFloatsToWav(selfChirpData, targetRate);
+      
+      if (_preloadedSoLoudChirpSource != null) {
+        try {
+          SoLoud.instance.disposeSource(_preloadedSoLoudChirpSource!);
+        } catch (_) {}
+      }
+      
+      _preloadedSoLoudChirpSource = await SoLoud.instance.loadMem(
+        "preloaded_calibration_chirp.wav",
+        wavBytes,
+        mode: LoadMode.memory,
+      );
+      onLogUpdate?.call("⚡ SoLoud calibration chirp pre-loaded into memory successfully.");
+    } catch (e) {
+      onLogUpdate?.call("⚠️ Failed to preload SoLoud chirp: $e");
+    }
+  }
+
   Future<void> preloadChirpPlayer() async {
     if (Platform.isWindows) return;
     if (_isPreloadingChirp) {
@@ -181,6 +223,9 @@ class PartySyncService {
       
       await _chirpPlayer.setAudioSource(ja.AudioSource.file(path));
       await _chirpPlayer.setVolume(1.0);
+
+      // Preload SoLoud chirp!
+      await preloadSoLoudChirp();
     } catch (e) {
       onLogUpdate?.call("⚠️ Failed to preload chirp player: $e");
     } finally {
@@ -271,10 +316,17 @@ class PartySyncService {
         onLogUpdate?.call("❌ WebSocket channel exception: $err");
       }, onDone: () {
         onLogUpdate?.call("🔌 WebSocket channel disconnected.");
+        _handleWebSocketDisconnect(partyId, token);
       });
 
-      // Warm up Server-Client time sync calibration
-      _triggerWANTimesync();
+      // Warm up Server-Client time sync calibration with 5 rapid pings 250ms apart
+      _acceptedPingCount = 0;
+      for (int i = 0; i < 5; i++) {
+        Timer(Duration(milliseconds: i * 250), () {
+          _triggerWANTimesync();
+        });
+      }
+
       _ntpTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
         _triggerWANTimesync();
       });
@@ -283,8 +335,32 @@ class PartySyncService {
     }
   }
 
+  void _handleWebSocketDisconnect(String partyId, String token) {
+    _wsChannel = null;
+    if (_isReconnecting) return;
+    _isReconnecting = true;
+    
+    onLogUpdate?.call("🔌 WebSocket disconnected. Initiating auto-reconnect sequence...");
+    
+    // Attempt reconnection after 2 seconds
+    Timer(const Duration(seconds: 2), () async {
+      if (!_isReconnecting) return; // Reconnection was cancelled/disposed
+      try {
+        onLogUpdate?.call("🔌 Attempting WebSocket reconnection...");
+        await connectWebSocket(partyId, token);
+        _isReconnecting = false;
+        onLogUpdate?.call("🔌 WebSocket reconnected successfully!");
+      } catch (e) {
+        _isReconnecting = false;
+        onLogUpdate?.call("❌ Reconnection attempt failed: $e");
+        _handleWebSocketDisconnect(partyId, token);
+      }
+    });
+  }
+
   /// Disconnects active web socket and stops time sync heartbeats
   Future<void> disconnect() async {
+    _isReconnecting = false;
     _ntpTimer?.cancel();
     _wsSubscription?.cancel();
     _wsChannel?.sink.close();
@@ -293,11 +369,19 @@ class PartySyncService {
     _hostAcousticDelay = 0;
     _alignmentDataMap.clear();
     _isNtpSuspended = false;
+    _acceptedPingCount = 0;
     
     if (_preloadedTestSoundSource != null) {
       try {
         SoLoud.instance.disposeSource(_preloadedTestSoundSource!);
         _preloadedTestSoundSource = null;
+      } catch (_) {}
+    }
+    
+    if (_preloadedSoLoudChirpSource != null) {
+      try {
+        SoLoud.instance.disposeSource(_preloadedSoLoudChirpSource!);
+        _preloadedSoLoudChirpSource = null;
       } catch (_) {}
     }
     
@@ -367,11 +451,15 @@ class PartySyncService {
 
         if (acceptUpdate) {
           _roundTripTime = newRtt;
-          // Kalman-like weighted smoothing: 70% historical, 30% new
-          if (_serverClockOffset == 0) {
-            _serverClockOffset = newOffset;
+          _acceptedPingCount++;
+          if (_serverClockOffset == 0 || _acceptedPingCount <= 5) {
+            // Rapid convergence during warmup phase
+            _serverClockOffset = (_serverClockOffset == 0)
+                ? newOffset
+                : (_serverClockOffset * 0.5 + newOffset * 0.5).round();
           } else {
-            _serverClockOffset = (_serverClockOffset * 0.7 + newOffset * 0.3).round();
+            // High inertia lock during active play session (95% history / 5% new)
+            _serverClockOffset = (_serverClockOffset * 0.95 + newOffset * 0.05).round();
           }
           onLogUpdate?.call("🎯 Network Lock (Filter accepted). RTT: ${_roundTripTime}ms | Min RTT: ${minRtt}ms | Offset: ${_serverClockOffset}ms");
         } else {
@@ -575,18 +663,24 @@ class PartySyncService {
         );
       }
 
-      // Load dynamic WAV directly into SoLoud heap
-      final Uint8List wavBytes = _packageFloatsToWav(selfChirpData, targetRate);
+      // Use preloaded SoLoud chirp if available!
       bool playedViaSoLoud = false;
-      try {
-        _activeChirpSource = await SoLoud.instance.loadMem(
-          "dynamic_calibration_chirp.wav",
-          wavBytes,
-          mode: LoadMode.memory,
-        );
-        onLogUpdate?.call("⚡ Dynamic chirp loaded to SoLoud memory successfully.");
-      } catch (e) {
-        onLogUpdate?.call("⚠️ SoLoud chirp load failed: $e");
+      if (_preloadedSoLoudChirpSource == null) {
+        onLogUpdate?.call("⚡ Loading dynamic chirp to SoLoud memory on-the-fly...");
+        final Uint8List wavBytes = _packageFloatsToWav(selfChirpData, targetRate);
+        try {
+          _activeChirpSource = await SoLoud.instance.loadMem(
+            "dynamic_calibration_chirp.wav",
+            wavBytes,
+            mode: LoadMode.memory,
+          );
+          onLogUpdate?.call("⚡ Dynamic chirp loaded to SoLoud memory successfully.");
+        } catch (e) {
+          onLogUpdate?.call("⚠️ SoLoud chirp load failed: $e");
+        }
+      } else {
+        _activeChirpSource = _preloadedSoLoudChirpSource;
+        onLogUpdate?.call("⚡ Reusing preloaded SoLoud chirp source.");
       }
 
       // Schedule the chirp playback!
@@ -718,7 +812,7 @@ class PartySyncService {
         }
 
         // Cleanup Host Soloud buffer immediately to purge heap
-        if (_activeChirpSource != null) {
+        if (_activeChirpSource != null && _activeChirpSource != _preloadedSoLoudChirpSource) {
           SoLoud.instance.disposeSource(_activeChirpSource!);
           _activeChirpSource = null;
         }
@@ -733,12 +827,13 @@ class PartySyncService {
         final dspAnalysis = await PartySyncService.runBackgroundDSPIsolate(dspArgs);
 
         // Cleanup Soloud buffer immediately to purge heap
-        if (_activeChirpSource != null) {
+        if (_activeChirpSource != null && _activeChirpSource != _preloadedSoLoudChirpSource) {
           SoLoud.instance.disposeSource(_activeChirpSource!);
           _activeChirpSource = null;
         }
 
         _isAcousticSyncing = false;
+        _isNtpSuspended = false; // NTP can resume now!
         onLogUpdate?.call("🎯 Acoustic capture completed. Peak index: ${dspAnalysis.tSelf}");
         
         // Send alignment consensus data to Room Coordinator
@@ -822,15 +917,8 @@ class PartySyncService {
         final String localPath = await _getLocalCachedPath(track.id);
         final file = File(localPath);
         if (await file.exists()) {
-          onLogUpdate?.call("💾 Pre-cached hit! Preloading local track into SoLoud FFI heap...");
-          try {
-            _activeSoLoudSource = await SoLoud.instance.loadFile(localPath);
-            useSoLoud = true;
-            onLogUpdate?.call("⚡ Local track pre-loaded into SoLoud FFI heap successfully.");
-          } catch (e) {
-            onLogUpdate?.call("⚠️ SoLoud pre-load failed, falling back to just_audio: $e");
-            await _musicPlayer.setAudioSource(ja.AudioSource.file(localPath));
-          }
+          onLogUpdate?.call("💾 Pre-cached hit! Streaming local track file via just_audio...");
+          await _musicPlayer.setAudioSource(ja.AudioSource.file(localPath));
         } else {
           // Direct stream play through the proxy url
           onLogUpdate?.call("☁️ Cache miss. Streaming remote URL: ${track.audioStreamUrl}");
@@ -863,12 +951,15 @@ class PartySyncService {
       if (remainingDelayMs <= 0) {
         onLogUpdate?.call("🎵 Playing immediately!");
         await triggerPlay();
+        _isNtpSuspended = false;
       } else {
         _highPrecisionDelay(targetPlayTime).then((_) async {
           try {
             await triggerPlay();
           } catch (e) {
             onLogUpdate?.call("❌ High-precision play failed: $e");
+          } finally {
+            _isNtpSuspended = false;
           }
         });
       }
@@ -934,7 +1025,7 @@ class PartySyncService {
     }
 
     final int schedulingWindow = track.id == 'test_sound_track'
-        ? (guests.isNotEmpty ? 400 : 200)
+        ? (guests.isNotEmpty ? 800 : 200)
         : (guests.isNotEmpty ? 2500 : 600); // 2500ms for real remote song tracks to ensure robust buffering!
 
     final playAt = Date.nowMs() + _serverClockOffset + schedulingWindow;
@@ -1269,6 +1360,7 @@ class PartySyncService {
         });
       }
 
+      _isNtpSuspended = false;
       // Complete the sync barrier completer since consensus was computed
       if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
         _syncCompleter!.complete();
