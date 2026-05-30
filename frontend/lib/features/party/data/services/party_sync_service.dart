@@ -33,6 +33,7 @@ class PartySyncService {
   int _roundTripTime = 0;
   Timer? _ntpTimer;
   bool _isNtpSuspended = false;
+  final List<int> _rttHistory = [];
 
   // Circular audio recording buffer
   StreamSubscription<List<int>>? _recorderSubscription;
@@ -48,8 +49,9 @@ class PartySyncService {
   MediaTrack? activeTrack;
   bool isSongPlaying = false;
 
-  // Dynamic chirp sources
   AudioSource? _activeChirpSource;
+  AudioSource? _activeSoLoudSource;
+  AudioSource? _preloadedTestSoundSource;
   
   bool _isPreloadingChirp = false;
   bool _isStartingMic = false;
@@ -291,6 +293,14 @@ class PartySyncService {
     _hostAcousticDelay = 0;
     _alignmentDataMap.clear();
     _isNtpSuspended = false;
+    
+    if (_preloadedTestSoundSource != null) {
+      try {
+        SoLoud.instance.disposeSource(_preloadedTestSoundSource!);
+        _preloadedTestSoundSource = null;
+      } catch (_) {}
+    }
+    
     stopAudio(); // Stop playback and mic on every disconnect
   }
 
@@ -303,6 +313,14 @@ class PartySyncService {
     _hostAcousticDelay = 0;
     _alignmentDataMap.clear();
     _isNtpSuspended = false;
+
+    if (_activeSoLoudSource != null && _activeSoLoudSource != _preloadedTestSoundSource) {
+      try {
+        SoLoud.instance.disposeSource(_activeSoLoudSource!);
+        _activeSoLoudSource = null;
+      } catch (_) {}
+    }
+
     onSongStateChanged?.call(false);
     onLogUpdate?.call("🔇 Audio stopped and playback state reset.");
   }
@@ -328,19 +346,47 @@ class PartySyncService {
         final serverRx = data['serverRx'] as int;
         final clientRx = Date.nowMs();
 
-        _roundTripTime = (clientRx - clientTx);
-        // Server time offset estimation: server_time = local_time + offset
-        _serverClockOffset = (serverRx - (clientTx + clientRx) ~/ 2);
-        onLogUpdate?.call("🎯 Network Lock. RTT: ${_roundTripTime}ms | Offset: ${_serverClockOffset}ms");
+        final int newRtt = (clientRx - clientTx);
+        final int newOffset = (serverRx - (clientTx + clientRx) ~/ 2);
+
+        // Keep rolling buffer of 10 pings
+        _rttHistory.add(newRtt);
+        if (_rttHistory.length > 10) {
+          _rttHistory.removeAt(0);
+        }
+
+        // Get minimum RTT in rolling buffer
+        int minRtt = newRtt;
+        for (final r in _rttHistory) {
+          if (r < minRtt) minRtt = r;
+        }
+
+        // RTT Gate: Discard update if current RTT is > 1.2x the min RTT (uncongested base)
+        // Ensure we always allow the first couple of updates to populate the gate
+        bool acceptUpdate = _rttHistory.length < 3 || newRtt <= (minRtt * 1.2).round();
+
+        if (acceptUpdate) {
+          _roundTripTime = newRtt;
+          // Kalman-like weighted smoothing: 70% historical, 30% new
+          if (_serverClockOffset == 0) {
+            _serverClockOffset = newOffset;
+          } else {
+            _serverClockOffset = (_serverClockOffset * 0.7 + newOffset * 0.3).round();
+          }
+          onLogUpdate?.call("🎯 Network Lock (Filter accepted). RTT: ${_roundTripTime}ms | Min RTT: ${minRtt}ms | Offset: ${_serverClockOffset}ms");
+        } else {
+          onLogUpdate?.call("⏳ NTP Update Gated (RTT Spike rejected). RTT: ${newRtt}ms | Min RTT: ${minRtt}ms | Offset kept: ${_serverClockOffset}ms");
+        }
         break;
       }
 
       case 'sync:trigger': {
-        onLogUpdate?.call("🎙️ Sync trigger frame received from server. Running acoustic alignment...");
+        final int? chirpPlayAt = data['chirpPlayAt'] as int?;
+        onLogUpdate?.call("🎙️ Sync trigger frame received from server. Running scheduled acoustic alignment... PlayAt: $chirpPlayAt");
         _acousticOffset = 0;
         _hostAcousticDelay = 0;
         onCalculationComplete?.call(0.0, 0.0, "⚡ Syncing: calibration in progress...");
-        executeDynamicAcousticSync();
+        executeDynamicAcousticSync(targetChirpPlayAt: chirpPlayAt);
         break;
       }
 
@@ -472,7 +518,7 @@ class PartySyncService {
   }
 
   /// Dynamically synthesizes chirp on-demand, plays via Soloud, records mic, and processes in background Isolate
-  Future<void> executeDynamicAcousticSync() async {
+  Future<void> executeDynamicAcousticSync({int? targetChirpPlayAt}) async {
     _isNtpSuspended = true;
     try {
       // 1. INSTANTLY STOP AND SILENCE MUSIC PLAYER TO PREVENT ACOUSTIC SATURATION
@@ -493,9 +539,6 @@ class PartySyncService {
       onLogUpdate?.call("🎙️ Securing raw microphone focus...");
       await _stopMicrophoneStream();
       await _startContinuousMicrophoneStream();
-
-      // 1. Capture snapshot start marker BEFORE generating or playing chirps to guarantee complete waveform inclusion
-      final int snapshotStartMarker = _totalBytesRecorded;
 
       onLogUpdate?.call("⚡ Generating dynamic calibration chirps...");
 
@@ -542,14 +585,39 @@ class PartySyncService {
           mode: LoadMode.memory,
         );
         onLogUpdate?.call("⚡ Dynamic chirp loaded to SoLoud memory successfully.");
-        SoLoud.instance.play(_activeChirpSource!);
-        playedViaSoLoud = true;
+      } catch (e) {
+        onLogUpdate?.call("⚠️ SoLoud chirp load failed: $e");
+      }
+
+      // Schedule the chirp playback!
+      int remainingChirpDelayMs = 0;
+      int actualChirpPlayEpoch = Date.nowMs();
+      
+      if (targetChirpPlayAt != null) {
+        final int localChirpPlayTarget = targetChirpPlayAt - _serverClockOffset;
+        remainingChirpDelayMs = localChirpPlayTarget - Date.nowMs();
+        actualChirpPlayEpoch = localChirpPlayTarget;
+      }
+      
+      onLogUpdate?.call("🔊 Calibration chirp scheduled in ${remainingChirpDelayMs}ms.");
+      
+      if (remainingChirpDelayMs > 0) {
+        await _highPrecisionDelay(actualChirpPlayEpoch);
+      }
+
+      // 1. Capture snapshot start marker EXACTLY at the moment of scheduled chirp emission
+      final int snapshotStartMarker = _totalBytesRecorded;
+
+      onLogUpdate?.call("🔊 Emitting calibration chirp (${isHost ? '1.0–2.0' : 'dynamic High'}kHz scheduled).");
+      try {
+        if (_activeChirpSource != null) {
+          SoLoud.instance.play(_activeChirpSource!);
+          playedViaSoLoud = true;
+        }
       } catch (e) {
         onLogUpdate?.call("⚠️ SoLoud chirp playback failed, falling back to just_audio: $e");
       }
 
-      // Emit chirp instantly (using SoLoud or just_audio fallback)
-      onLogUpdate?.call("🔊 Emitting calibration chirp (${isHost ? '1.5–3.0' : 'dynamic High'}kHz — audible reference).");
       if (!playedViaSoLoud) {
         try {
           if (_dynamicChirpPath == null) {
@@ -707,9 +775,18 @@ class PartySyncService {
       onLogUpdate?.call("🎵 Stopping current music player...");
       await _musicPlayer.stop();
 
+      if (_activeSoLoudSource != null && _activeSoLoudSource != _preloadedTestSoundSource) {
+        try {
+          SoLoud.instance.disposeSource(_activeSoLoudSource!);
+          _activeSoLoudSource = null;
+        } catch (_) {}
+      }
+
       if (track.audioStreamUrl.isEmpty) {
         onLogUpdate?.call("⚠️ Warning: Received track audioStreamUrl is empty!");
       }
+
+      bool useSoLoud = false;
 
       if (track.id == 'test_sound_track') {
         final tempDir = await getTemporaryDirectory();
@@ -723,16 +800,37 @@ class PartySyncService {
           await testSoundFile.writeAsBytes(testSoundWavBytes);
           onLogUpdate?.call("🔊 Saved synthesized WAV test pop to disk.");
         }
-        onLogUpdate?.call("🔊 Loading test sound file into player...");
-        await _musicPlayer.setAudioSource(ja.AudioSource.file(testSoundFile.path));
-        onLogUpdate?.call("🔊 Test sound source set successfully.");
+        
+        if (_preloadedTestSoundSource != null) {
+          _activeSoLoudSource = _preloadedTestSoundSource;
+          useSoLoud = true;
+          onLogUpdate?.call("⚡ Test pop reused from preloaded memory heap!");
+        } else {
+          onLogUpdate?.call("🔊 Preloading test sound WAV into SoLoud FFI heap...");
+          try {
+            _preloadedTestSoundSource = await SoLoud.instance.loadFile(testSoundFile.path);
+            _activeSoLoudSource = _preloadedTestSoundSource;
+            useSoLoud = true;
+            onLogUpdate?.call("⚡ Test pop pre-loaded into SoLoud FFI heap successfully.");
+          } catch (e) {
+            onLogUpdate?.call("⚠️ SoLoud pre-load failed, falling back to just_audio: $e");
+            await _musicPlayer.setAudioSource(ja.AudioSource.file(testSoundFile.path));
+          }
+        }
       } else {
         // Cache-first high-precision local storage playback verification
         final String localPath = await _getLocalCachedPath(track.id);
         final file = File(localPath);
         if (await file.exists()) {
-          onLogUpdate?.call("💾 Pre-cached hit! Playing track locally from storage: $localPath");
-          await _musicPlayer.setAudioSource(ja.AudioSource.file(localPath));
+          onLogUpdate?.call("💾 Pre-cached hit! Preloading local track into SoLoud FFI heap...");
+          try {
+            _activeSoLoudSource = await SoLoud.instance.loadFile(localPath);
+            useSoLoud = true;
+            onLogUpdate?.call("⚡ Local track pre-loaded into SoLoud FFI heap successfully.");
+          } catch (e) {
+            onLogUpdate?.call("⚠️ SoLoud pre-load failed, falling back to just_audio: $e");
+            await _musicPlayer.setAudioSource(ja.AudioSource.file(localPath));
+          }
         } else {
           // Direct stream play through the proxy url
           onLogUpdate?.call("☁️ Cache miss. Streaming remote URL: ${track.audioStreamUrl}");
@@ -740,27 +838,37 @@ class PartySyncService {
         }
       }
 
-      int remainingDelayMs;
+      int targetPlayTime;
       if (targetLocalTimeOrDelay > 1000000000000) {
         // It's an absolute epoch timestamp!
-        final targetPlayTime = targetLocalTimeOrDelay + _acousticOffset;
-        remainingDelayMs = targetPlayTime - Date.nowMs();
-        onLogUpdate?.call("🎵 Audio loaded. Target epoch: $targetPlayTime. Current epoch: ${Date.nowMs()}. Remaining delay: ${remainingDelayMs}ms");
+        targetPlayTime = targetLocalTimeOrDelay + _acousticOffset;
       } else {
         // It's a relative delay!
-        remainingDelayMs = targetLocalTimeOrDelay + _acousticOffset;
-        onLogUpdate?.call("🎵 Audio loaded. Relative delay: ${targetLocalTimeOrDelay}ms. Remaining delay: ${remainingDelayMs}ms");
+        targetPlayTime = Date.nowMs() + targetLocalTimeOrDelay + _acousticOffset;
+      }
+
+      final int remainingDelayMs = targetPlayTime - Date.nowMs();
+      onLogUpdate?.call("🎵 Audio loaded. Target epoch: $targetPlayTime. Current epoch: ${Date.nowMs()}. Remaining delay: ${remainingDelayMs}ms");
+
+      Future<void> triggerPlay() async {
+        if (useSoLoud && _activeSoLoudSource != null) {
+          onLogUpdate?.call("🔊 Dispatching direct C++ SoLoud FFI playback instantly!");
+          SoLoud.instance.play(_activeSoLoudSource!);
+        } else {
+          onLogUpdate?.call("🔊 Dispatching standard just_audio playback!");
+          await _musicPlayer.play();
+        }
       }
 
       if (remainingDelayMs <= 0) {
         onLogUpdate?.call("🎵 Playing immediately!");
-        await _musicPlayer.play();
+        await triggerPlay();
       } else {
-        Timer(Duration(milliseconds: remainingDelayMs), () async {
+        _highPrecisionDelay(targetPlayTime).then((_) async {
           try {
-            await _musicPlayer.play();
+            await triggerPlay();
           } catch (e) {
-            onLogUpdate?.call("❌ Delayed play failed: $e");
+            onLogUpdate?.call("❌ High-precision play failed: $e");
           }
         });
       }
@@ -769,6 +877,17 @@ class PartySyncService {
       onSongStateChanged?.call(true);
     } catch (e) {
       onLogUpdate?.call("❌ _executeCompensatedPlayback failed: $e");
+    }
+  }
+
+  static Future<void> _highPrecisionDelay(int targetEpochTimeMs) async {
+    final int preWaitMs = targetEpochTimeMs - Date.nowMs() - 15;
+    if (preWaitMs > 0) {
+      await Future.delayed(Duration(milliseconds: preWaitMs));
+    }
+    // High-precision busy wait spin-lock for the final 15 milliseconds
+    while (Date.nowMs() < targetEpochTimeMs) {
+      // Busy wait spin-lock loop
     }
   }
 
@@ -786,9 +905,10 @@ class PartySyncService {
       _hostTSelf = null;
       _syncCompleter = Completer<void>();
 
-      onLogUpdate?.call("⚡ Triggering rapid acoustic calibration pass with ${guests.length} guest(s)...");
+      final int chirpPlayAt = Date.nowMs() + _serverClockOffset + 600; // Schedule chirp 600ms in the future
+      onLogUpdate?.call("⚡ Triggering rapid scheduled acoustic calibration pass with ${guests.length} guest(s)... PlayAt: $chirpPlayAt");
       onCalculationComplete?.call(0.0, 0.0, "⚡ Syncing: calibration in progress...");
-      _sendSocketMessage('sync:trigger', {});
+      _sendSocketMessage('sync:trigger', {'chirpPlayAt': chirpPlayAt});
 
       // Wait for consensus calculations to complete, up to a 4.5-second barrier timeout
       await _syncCompleter!.future.timeout(
