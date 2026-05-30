@@ -156,7 +156,7 @@ function handleSocketMessage(ws: WebSocket, payload: { event: string; data: any 
 
     case 'playback:play': {
       if (meta.partyId) {
-        const { id, trackId, title, audioStreamUrl, coverArtUrl, artistName, albumTitle, playAt, isUnsynced } = data;
+        const { id, trackId, title, audioStreamUrl, coverArtUrl, artistName, albumTitle, playAt, isUnsynced, isNoNtp } = data;
         const actualTrackId = id || trackId;
         console.log(`[WS] Directing synchronized playback: "${title}" in party room: ${meta.partyId}. Target Start Time: ${playAt}`);
         broadcastToRoom(meta.partyId, 'playback:play', {
@@ -169,6 +169,7 @@ function handleSocketMessage(ws: WebSocket, payload: { event: string; data: any 
           albumTitle,
           playAt: playAt || (Date.now() + 1000), // Default to start in 1 second if not specified
           isUnsynced: isUnsynced === true,
+          isNoNtp: isNoNtp === true,
           directedBy: meta.userId,
         });
       }

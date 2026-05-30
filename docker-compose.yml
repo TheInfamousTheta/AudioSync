@@ -19,6 +19,7 @@ services:
     environment:
       - PORT=4000
       - SAAVN_API_URL=http://jiosaavn-api:3000
+      - DATABASE_PATH=/app/data/db.sqlite
     depends_on:
       - jiosaavn-api
     restart: always

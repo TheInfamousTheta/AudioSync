@@ -4,7 +4,9 @@ import fs from 'fs';
 import bcrypt from 'bcrypt';
 
 
-const dbPath = path.resolve(__dirname, '../../db.sqlite');
+const dbPath = process.env.DATABASE_PATH 
+  ? path.resolve(process.env.DATABASE_PATH) 
+  : path.resolve(__dirname, '../../db.sqlite');
 console.log(`[DB] Database path: ${dbPath}`);
 
 export const db = new sqlite3.Database(dbPath);
