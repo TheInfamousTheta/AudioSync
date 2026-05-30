@@ -561,6 +561,43 @@ class _PartySyncScreenState extends State<PartySyncScreen> {
                                   ),
                                 ],
                               ),
+                              const SizedBox(height: 12),
+                              ElevatedButton.icon(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: state.isSimulatingDelay 
+                                      ? Colors.redAccent.withValues(alpha: 0.15)
+                                      : Colors.white10,
+                                  foregroundColor: state.isSimulatingDelay ? Colors.redAccent : AppColors.onSurface,
+                                  side: BorderSide(
+                                    color: state.isSimulatingDelay ? Colors.redAccent : Colors.white24,
+                                    width: 1.0,
+                                  ),
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                ),
+                                onPressed: () {
+                                  context.read<PartyBloc>().add(ToggleSimulateGuestDelayEvent());
+                                },
+                                icon: Icon(
+                                  state.isSimulatingDelay ? Icons.timer_rounded : Icons.timer_outlined,
+                                  size: 14,
+                                ),
+                                label: SizedBox(
+                                  width: double.infinity,
+                                  child: Text(
+                                    state.isSimulatingDelay
+                                        ? 'SIMULATING +300MS GUEST DELAY (ACTIVE)'
+                                        : 'SIMULATE +300MS GUEST DELAY (INACTIVE)',
+                                    textAlign: TextAlign.center,
+                                    style: const TextStyle(
+                                      fontFamily: 'Plus Jakarta Sans',
+                                      fontSize: 9,
+                                      fontWeight: FontWeight.bold,
+                                      letterSpacing: 0.5,
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ],
                           ],
                         ),

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:audio_sync/core/network/api_client.dart';
 import '../../data/services/party_sync_service.dart';
+import '../../data/services/ble_offline_sync_service.dart';
 import 'party_event.dart';
 import 'party_state.dart';
 import 'package:audio_sync/features/home/dashboard_payload.dart';
@@ -10,6 +11,7 @@ import 'package:audio_sync/core/widgets/download_manager.dart';
 class PartyBloc extends Bloc<PartyEvent, PartyState> {
   final ApiClient _apiClient = ApiClient();
   final PartySyncService _syncService = PartySyncService();
+  final BleOfflineSyncService _offlineSyncService = BleOfflineSyncService();
   
   StreamSubscription? _logSubscription;
   StreamSubscription? _songSubscription;
@@ -23,6 +25,43 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
   PartyBloc() : super(PartyInitialState()) {
     
     // Wire the underlying high-fidelity synchronization engine listeners
+    _syncService.onLogUpdate = (log) {
+      // ignore: avoid_print
+      print("[SYNC-CORE] $log");
+      add(UpdatePartyDebugInfoEvent(log: log));
+    };
+
+    _offlineSyncService.onLogUpdate = (log) {
+      // ignore: avoid_print
+      print("[SYNC-OFFLINE] $log");
+      add(UpdatePartyDebugInfoEvent(log: log));
+    };
+
+    _offlineSyncService.onSongStateChanged = (isPlaying) {
+      final currentState = state;
+      if (currentState is PartyJoinedState) {
+        add(UpdatePartyDetailsEvent(
+          partyId: currentState.partyId,
+          token: "",
+          isPlayStateChangeOnly: true,
+          isPlaying: isPlaying,
+        ));
+      }
+    };
+
+    _offlineSyncService.onTrackSynced = (track, isPlaying) {
+      final currentState = state;
+      if (currentState is PartyJoinedState) {
+        add(UpdatePartyDetailsEvent(
+          partyId: currentState.partyId,
+          token: "",
+          isPlayStateChangeOnly: true,
+          isPlaying: isPlaying,
+          activeTrack: track,
+        ));
+      }
+    };
+
     _syncService.onLogUpdate = (log) {
       // ignore: avoid_print
       print("[SYNC-CORE] $log");
@@ -312,7 +351,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           );
           track = playlistTrack;
         }
-        if (track.audioStreamUrl.isEmpty) {
+        if (track.audioStreamUrl.isEmpty && !currentState.isOffline) {
           final metadata = await _apiClient.fetchTrackMetadata(track.id);
           final streamUrl = metadata['audioStreamUrl'] as String? ?? "";
           track = MediaTrack(
@@ -326,7 +365,11 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
             durationInSeconds: track.durationInSeconds,
           );
         }
-        await _syncService.broadcastPlay(track);
+        if (currentState.isOffline) {
+          await _offlineSyncService.broadcastPlay(track);
+        } else {
+          await _syncService.broadcastPlay(track);
+        }
         
         final freshState = state;
         if (freshState is PartyJoinedState) {
@@ -351,7 +394,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           );
           track = playlistTrack;
         }
-        if (track.audioStreamUrl.isEmpty) {
+        if (track.audioStreamUrl.isEmpty && !currentState.isOffline) {
           final metadata = await _apiClient.fetchTrackMetadata(track.id);
           final streamUrl = metadata['audioStreamUrl'] as String? ?? "";
           track = MediaTrack(
@@ -365,7 +408,11 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
             durationInSeconds: track.durationInSeconds,
           );
         }
-        await _syncService.broadcastPlayUnsynced(track);
+        if (currentState.isOffline) {
+          await _offlineSyncService.broadcastPlayUnsynced(track);
+        } else {
+          await _syncService.broadcastPlayUnsynced(track);
+        }
         
         final freshState = state;
         if (freshState is PartyJoinedState) {
@@ -393,7 +440,11 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           durationInSeconds: 1,
         );
         
-        await _syncService.broadcastPlay(mockTrack);
+        if (currentState.isOffline) {
+          await _offlineSyncService.broadcastPlay(mockTrack);
+        } else {
+          await _syncService.broadcastPlay(mockTrack);
+        }
         
         final freshState = state;
         if (freshState is PartyJoinedState) {
@@ -421,7 +472,11 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           durationInSeconds: 1,
         );
         
-        await _syncService.broadcastPlayUnsynced(mockTrack);
+        if (currentState.isOffline) {
+          await _offlineSyncService.broadcastPlayUnsynced(mockTrack);
+        } else {
+          await _syncService.broadcastPlayUnsynced(mockTrack);
+        }
         
         final freshState = state;
         if (freshState is PartyJoinedState) {
@@ -449,7 +504,11 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           durationInSeconds: 1,
         );
         
-        await _syncService.broadcastPlayNoNtp(mockTrack);
+        if (currentState.isOffline) {
+          await _offlineSyncService.broadcastPlayNoNtp(mockTrack);
+        } else {
+          await _syncService.broadcastPlayNoNtp(mockTrack);
+        }
         
         final freshState = state;
         if (freshState is PartyJoinedState) {
@@ -469,6 +528,39 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       if (currentState is! PartyJoinedState) return;
 
       try {
+        if (currentState.isOffline) {
+          if (currentState.isHost) {
+            if (currentState.isPlaying) {
+              await _offlineSyncService.broadcastPause();
+              final freshState = state;
+              if (freshState is PartyJoinedState) {
+                emit(freshState.copyWith(isPlaying: false));
+              }
+            } else if (currentState.activeTrack != null) {
+              await _offlineSyncService.broadcastPlay(currentState.activeTrack!);
+              final freshState = state;
+              if (freshState is PartyJoinedState) {
+                emit(freshState.copyWith(isPlaying: true));
+              }
+            }
+          } else {
+            if (currentState.isPlaying) {
+              _offlineSyncService.pauseLocalPlayer();
+              final freshState = state;
+              if (freshState is PartyJoinedState) {
+                emit(freshState.copyWith(isPlaying: false));
+              }
+            } else if (currentState.activeTrack != null) {
+              _offlineSyncService.resumeLocalPlayer();
+              final freshState = state;
+              if (freshState is PartyJoinedState) {
+                emit(freshState.copyWith(isPlaying: true));
+              }
+            }
+          }
+          return;
+        }
+
         if (currentState.isHost) {
           if (currentState.isPlaying) {
             await _syncService.broadcastPause();
@@ -506,7 +598,12 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
 
     on<SeekPartyPlaybackEvent>((event, emit) async {
       try {
-        await _syncService.broadcastSeek(event.positionInSeconds);
+        final currentState = state;
+        if (currentState is PartyJoinedState && currentState.isOffline) {
+          await _offlineSyncService.broadcastSeek(event.positionInSeconds);
+        } else {
+          await _syncService.broadcastSeek(event.positionInSeconds);
+        }
       } catch (e) {
         // ignore: avoid_print
         print("[BLOC] Playback seek failed: $e");
@@ -518,8 +615,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       _debugResult = 'Standing by for synchronization...';
       emit(PartyLoadingState());
       try {
-        await _syncService.initialize();
-        await _syncService.setupBleOfflineSync(event.deviceId, isHost: event.isHost);
+        await _offlineSyncService.setupBleOfflineSync(event.deviceId, isHost: event.isHost);
 
         emit(PartyJoinedState(
           partyId: 'offline-ble-sync-room',
@@ -529,8 +625,8 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
           playlist: const [],
           isHost: event.isHost,
           isOffline: true,
-          isPlaying: _syncService.isSongPlaying,
-          activeTrack: _syncService.activeTrack,
+          isPlaying: _offlineSyncService.isSongPlaying,
+          activeTrack: _offlineSyncService.activeTrack,
           debugLogs: List<String>.from(_debugLogs),
           debugResult: _debugResult,
         ));
@@ -559,10 +655,31 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
       }
     });
 
+    on<ToggleSimulateGuestDelayEvent>((event, emit) async {
+      final currentState = state;
+      if (currentState is! PartyJoinedState) return;
+
+      final nextSimulateState = !currentState.isSimulatingDelay;
+      _syncService.simulateGuestDelay300ms = nextSimulateState;
+      
+      _debugLogs.insert(0, "[${DateTime.now().toString().substring(11, 19)}] 🧪 Simulated 300ms Guest Delay: ${nextSimulateState ? 'ENABLED' : 'DISABLED'}");
+
+      emit(currentState.copyWith(
+        isSimulatingDelay: nextSimulateState,
+        debugLogs: List<String>.from(_debugLogs),
+      ));
+    });
+
     on<DisconnectPartyEvent>((event, emit) async {
       _refreshTimer?.cancel();
-      _syncService.stopAudio();
-      await _syncService.disconnect();
+      final currentState = state;
+      if (currentState is PartyJoinedState && currentState.isOffline) {
+        _offlineSyncService.stopAudio();
+        await _offlineSyncService.disconnect();
+      } else {
+        _syncService.stopAudio();
+        await _syncService.disconnect();
+      }
       _debugLogs.clear();
       _debugResult = 'Standing by for synchronization...';
       emit(PartyInitialState());
@@ -588,6 +705,7 @@ class PartyBloc extends Bloc<PartyEvent, PartyState> {
     _trackSubscription?.cancel();
     _refreshTimer?.cancel();
     _syncService.dispose();
+    _offlineSyncService.dispose();
     return super.close();
   }
 }

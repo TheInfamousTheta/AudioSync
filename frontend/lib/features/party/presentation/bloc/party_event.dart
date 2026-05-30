@@ -74,5 +74,4 @@ class PlayTestSoundUnsyncedEvent extends PartyEvent {}
 
 class PlayTestSoundNoNtpEvent extends PartyEvent {}
 
-
-
+class ToggleSimulateGuestDelayEvent extends PartyEvent {}

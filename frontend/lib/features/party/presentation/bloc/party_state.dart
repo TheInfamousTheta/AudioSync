@@ -25,6 +25,7 @@ class PartyJoinedState extends PartyState {
   final String sessionToken;
   final List<String> debugLogs;
   final String debugResult;
+  final bool isSimulatingDelay;
 
   PartyJoinedState({
     required this.partyId,
@@ -39,6 +40,7 @@ class PartyJoinedState extends PartyState {
     this.sessionToken = '',
     this.debugLogs = const [],
     this.debugResult = 'Standing by for synchronization...',
+    this.isSimulatingDelay = false,
   });
 
   PartyJoinedState copyWith({
@@ -54,6 +56,7 @@ class PartyJoinedState extends PartyState {
     String? sessionToken,
     List<String>? debugLogs,
     String? debugResult,
+    bool? isSimulatingDelay,
   }) {
     return PartyJoinedState(
       partyId: partyId ?? this.partyId,
@@ -68,6 +71,7 @@ class PartyJoinedState extends PartyState {
       sessionToken: sessionToken ?? this.sessionToken,
       debugLogs: debugLogs ?? this.debugLogs,
       debugResult: debugResult ?? this.debugResult,
+      isSimulatingDelay: isSimulatingDelay ?? this.isSimulatingDelay,
     );
   }
 }

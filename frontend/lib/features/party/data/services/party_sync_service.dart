@@ -7,8 +7,8 @@ import 'package:flutter_soloud/flutter_soloud.dart';
 import 'package:record/record.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:just_audio/just_audio.dart' as ja;
+import 'package:audio_session/audio_session.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:audio_sync/core/app_config.dart';
 import 'package:audio_sync/features/home/dashboard_payload.dart';
 import 'package:audio_sync/core/widgets/audio_systems_manager.dart';
@@ -50,11 +50,6 @@ class PartySyncService {
   // Dynamic chirp sources
   AudioSource? _activeChirpSource;
   
-  // Bluetooth BLE coordination states
-  BluetoothDevice? _connectedBleDevice;
-  BluetoothCharacteristic? _bleSyncCharacteristic;
-  StreamSubscription? _bleSubscription;
-  bool isOfflineMode = false;
   bool _isPreloadingChirp = false;
   bool _isStartingMic = false;
 
@@ -72,10 +67,7 @@ class PartySyncService {
   List<dynamic> members = const [];
   Uint8List? _hostCapturedMonoBuffer;
   int? _hostTSelf;
-
-  // Self-healing calibration retry state variables
-  int _calibrationRetryCount = 0;
-  static const int maxCalibrationRetries = 3;
+  bool simulateGuestDelay300ms = false;
 
   int getGuestIndex(String targetUserId) {
     final guests = members.where((m) {
@@ -202,6 +194,24 @@ class PartySyncService {
   }
 
   Future<void> initialize() async {
+    try {
+      final session = await AudioSession.instance;
+      await session.configure(AudioSessionConfiguration(
+        avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
+        avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.defaultToSpeaker | AVAudioSessionCategoryOptions.allowBluetooth,
+        avAudioSessionMode: AVAudioSessionMode.measurement,
+        androidAudioAttributes: const AndroidAudioAttributes(
+          contentType: AndroidAudioContentType.music,
+          usage: AndroidAudioUsage.media,
+        ),
+        androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
+      ));
+      await session.setActive(true);
+      onLogUpdate?.call("🔊 Audio session warmed up & configured for Play-and-Record measurement mode successfully.");
+    } catch (e) {
+      onLogUpdate?.call("⚠️ Audio session configuration warning: $e");
+    }
+
     if (!SoLoud.instance.isInitialized) {
       await SoLoud.instance.init();
     }
@@ -227,7 +237,6 @@ class PartySyncService {
 
   /// Establishes the real-time WebSocket signaling conduit
   Future<void> connectWebSocket(String partyId, String token) async {
-    isOfflineMode = false;
     await disconnect();
 
     String cleanedToken = token.trim();
@@ -277,10 +286,6 @@ class PartySyncService {
     _wsSubscription?.cancel();
     _wsChannel?.sink.close();
     _wsChannel = null;
-    _connectedBleDevice?.disconnect();
-    _bleSubscription?.cancel();
-    _connectedBleDevice = null;
-    _bleSyncCharacteristic = null;
     _acousticOffset = 0;
     _hostAcousticDelay = 0;
     _alignmentDataMap.clear();
@@ -325,6 +330,8 @@ class PartySyncService {
 
       case 'sync:trigger': {
         onLogUpdate?.call("🎙️ Sync trigger frame received from server. Running acoustic alignment...");
+        _acousticOffset = 0;
+        _hostAcousticDelay = 0;
         onCalculationComplete?.call(0.0, 0.0, "⚡ Syncing: calibration in progress...");
         executeDynamicAcousticSync();
         break;
@@ -335,15 +342,21 @@ class PartySyncService {
         final username = data['username'] as String;
         final tSelf = data['tSelf'] as int;
         final tCross = data['tCross'] as int;
+        final guestSampleRate = data['sampleRate'] as int? ?? DSPEngine.sampleRate;
 
-        onLogUpdate?.call("📥 Alignment data received from $username ($userId): tSelf=$tSelf, tCross=$tCross");
+        onLogUpdate?.call("📥 Alignment data received from $username ($userId): tSelf=$tSelf, tCross=$tCross, sampleRate=$guestSampleRate");
 
-        _alignmentDataMap[userId] = {'tSelf': tSelf, 'tCross': tCross, 'username': username};
+        _alignmentDataMap[userId] = {
+          'tSelf': tSelf,
+          'tCross': tCross,
+          'sampleRate': guestSampleRate,
+          'username': username,
+        };
 
         if (isHost && userId != hostId) {
           if (_hostCapturedMonoBuffer != null && _hostTSelf != null) {
             // Host correlation is done! Process instantly.
-            _correlateGuestAndComputeConsensus(userId, username, tSelf, tCross);
+            _correlateGuestAndComputeConsensus(userId, username, tSelf, tCross, guestSampleRate);
           } else {
             // Host is still recording/correlating! Queue alignment.
             _pendingGuestAlignments[userId] = {
@@ -351,6 +364,7 @@ class PartySyncService {
               'username': username,
               'tSelf': tSelf,
               'tCross': tCross,
+              'sampleRate': guestSampleRate,
             };
             onLogUpdate?.call("⏳ Host correlation pending. Queued $username's alignment.");
           }
@@ -359,31 +373,10 @@ class PartySyncService {
       }
 
       case 'sync:offset': {
-        final targetUserId = data['userId'] as String;
+        final targetUsername = data['username'] as String?;
         final offsetMs = data['offsetMs'] as int;
 
-        // Find my own record by localUsername in members list or alignment data map as fallback
-        var myUserId = "";
-        try {
-          final myMember = members.firstWhere(
-            (m) => m['username'] == localUsername,
-            orElse: () => null,
-          );
-          if (myMember != null) {
-            myUserId = myMember['userId'] as String? ?? "";
-          }
-        } catch (_) {}
-
-        if (myUserId.isEmpty) {
-          try {
-            myUserId = _alignmentDataMap.keys.firstWhere(
-              (uid) => _alignmentDataMap[uid]?['username'] == localUsername,
-              orElse: () => "",
-            );
-          } catch (_) {}
-        }
-
-        if (myUserId.isNotEmpty && targetUserId == myUserId) {
+        if (localUsername != null && localUsername == targetUsername) {
           _acousticOffset = offsetMs;
           onLogUpdate?.call("🎯 Acoustic calibration lock applied to player pipeline: ${_acousticOffset}ms delay compensation");
 
@@ -467,11 +460,8 @@ class PartySyncService {
     }
   }
 
-  /// Notifies all room members that the collaborative playlist has changed
   void broadcastPlaylistUpdate() {
-    if (!isOfflineMode) {
-      _sendSocketMessage('playlist:update', {});
-    }
+    _sendSocketMessage('playlist:update', {});
   }
 
   /// Dynamically synthesizes chirp on-demand, plays via Soloud, records mic, and processes in background Isolate
@@ -491,10 +481,13 @@ class PartySyncService {
       }
       _isAcousticSyncing = true;
 
-      if (!_isMicStreaming) {
-        onLogUpdate?.call("🎙️ Mic stream not active. Attempting to start stream on the fly...");
-        await _startContinuousMicrophoneStream();
-      }
+      // FORCE RESTART MICROPHONE STREAM TO SECURE AUDIO SESSION FOCUS & CLEAR STALE BUFFERS
+      onLogUpdate?.call("🎙️ Securing raw microphone focus...");
+      await _stopMicrophoneStream();
+      await _startContinuousMicrophoneStream();
+
+      // 1. Capture snapshot start marker BEFORE generating or playing chirps to guarantee complete waveform inclusion
+      final int snapshotStartMarker = _totalBytesRecorded;
 
       onLogUpdate?.call("⚡ Generating dynamic calibration chirps...");
 
@@ -578,8 +571,7 @@ class PartySyncService {
         return;
       }
 
-      // Acoustic timeline capture
-      final snapshotStartMarker = _totalBytesRecorded;
+      // Acoustic timeline capture (using snapshotStartMarker captured before chirp emission)
       final int targetLength = (targetRate * 1.5 * (Platform.isWindows ? 8 : 2)).toInt(); // channels * 2 bytes
       final Uint8List capturedBuffer = Uint8List(targetLength);
 
@@ -643,6 +635,7 @@ class PartySyncService {
               alignData['username'] as String,
               alignData['tSelf'] as int,
               alignData['tCross'] as int,
+              alignData['sampleRate'] as int? ?? DSPEngine.sampleRate,
             );
           });
         }
@@ -675,6 +668,7 @@ class PartySyncService {
         _sendSocketMessage('sync:alignment', {
           'tSelf': dspAnalysis.tSelf,
           'tCross': dspAnalysis.tCross,
+          'sampleRate': targetRate,
           'username': localUsername,
         });
       }
@@ -724,9 +718,6 @@ class PartySyncService {
         if (await file.exists()) {
           onLogUpdate?.call("💾 Pre-cached hit! Playing track locally from storage: $localPath");
           await _musicPlayer.setAudioSource(ja.AudioSource.file(localPath));
-        } else if (isOfflineMode) {
-          onLogUpdate?.call("❌ Playback aborted: '${track.title}' is not pre-downloaded for offline sync!");
-          return;
         } else {
           // Direct stream play through the proxy url
           onLogUpdate?.call("☁️ Cache miss. Streaming remote URL: ${track.audioStreamUrl}");
@@ -771,11 +762,11 @@ class PartySyncService {
 
     final guests = members.where((m) => m['userId'] != hostId).toList();
 
-    if (!isOfflineMode && guests.isNotEmpty) {
+    if (guests.isNotEmpty) {
       // Clear previous acoustic sync metrics before starting the new session calibration
       _alignmentDataMap.clear();
       _hostAcousticDelay = 0;
-      _calibrationRetryCount = 0;
+      _acousticOffset = 0;
       _hostCapturedMonoBuffer = null;
       _hostTSelf = null;
       _syncCompleter = Completer<void>();
@@ -808,128 +799,77 @@ class PartySyncService {
     }
 
     final playAt = Date.nowMs() + _serverClockOffset + (guests.isNotEmpty ? 1200 : 200) + _hostAcousticDelay;
-    
-    if (isOfflineMode && _bleSyncCharacteristic != null) {
-      // Offline Bluetooth BLE sync command broadcast
-      final Map<String, dynamic> bleFrame = {
-        'cmd': 'PLAY',
-        'id': track.id,
-        'title': track.title,
-        'artist': track.artistName,
-        'delay': 1000,
-      };
-      await _bleSyncCharacteristic!.write(utf8.encode(jsonEncode(bleFrame)));
-      _executeCompensatedPlayback(track, 1000);
-    } else {
-      // WebSocket server command broadcast
-      _sendSocketMessage('playback:play', {
-        'id': track.id,
-        'trackId': track.id,
-        'title': track.title,
-        'artistName': track.artistName,
-        'albumTitle': track.albumTitle,
-        'coverArtUrl': track.coverArtUrl,
-        'audioStreamUrl': track.audioStreamUrl,
-        'formatBadge': track.formatBadge,
-        'durationInSeconds': track.durationInSeconds,
-        'playAt': playAt,
-      });
-    }
+    // WebSocket server command broadcast
+    _sendSocketMessage('playback:play', {
+      'id': track.id,
+      'trackId': track.id,
+      'title': track.title,
+      'artistName': track.artistName,
+      'albumTitle': track.albumTitle,
+      'coverArtUrl': track.coverArtUrl,
+      'audioStreamUrl': track.audioStreamUrl,
+      'formatBadge': track.formatBadge,
+      'durationInSeconds': track.durationInSeconds,
+      'playAt': playAt,
+    });
   }
 
   Future<void> broadcastPlayUnsynced(MediaTrack track) async {
     activeTrack = track;
     _hostAcousticDelay = 0;
+    _acousticOffset = 0;
     
     final playAt = Date.nowMs() + _serverClockOffset + 600; // 600ms safety window for unsynced
-    onLogUpdate?.call("📢 broadcastPlayUnsynced initiated. playAt: $playAt, isOfflineMode: $isOfflineMode");
-    
-    if (isOfflineMode && _bleSyncCharacteristic != null) {
-      final Map<String, dynamic> bleFrame = {
-        'cmd': 'PLAY',
-        'id': track.id,
-        'title': track.title,
-        'artist': track.artistName,
-        'delay': 600,
-      };
-      await _bleSyncCharacteristic!.write(utf8.encode(jsonEncode(bleFrame)));
-      _executeCompensatedPlayback(track, 600);
-    } else {
-      _sendSocketMessage('playback:play', {
-        'id': track.id,
-        'trackId': track.id,
-        'title': track.title,
-        'artistName': track.artistName,
-        'albumTitle': track.albumTitle,
-        'coverArtUrl': track.coverArtUrl,
-        'audioStreamUrl': track.audioStreamUrl,
-        'formatBadge': track.formatBadge,
-        'durationInSeconds': track.durationInSeconds,
-        'playAt': playAt,
-        'isUnsynced': true,
-      });
+    onLogUpdate?.call("📢 broadcastPlayUnsynced initiated. playAt: $playAt");
+    _sendSocketMessage('playback:play', {
+      'id': track.id,
+      'trackId': track.id,
+      'title': track.title,
+      'artistName': track.artistName,
+      'albumTitle': track.albumTitle,
+      'coverArtUrl': track.coverArtUrl,
+      'audioStreamUrl': track.audioStreamUrl,
+      'formatBadge': track.formatBadge,
+      'durationInSeconds': track.durationInSeconds,
+      'playAt': playAt,
+      'isUnsynced': true,
+    });
 
-      // Play locally immediately on the Host to bypass WebSocket roundtrip latency
-      onLogUpdate?.call("📢 Executing local instant unsynced playback on Host...");
-      _executeCompensatedPlayback(track, Date.nowMs() + 600);
-    }
+    // Play locally immediately on the Host to bypass WebSocket roundtrip latency
+    onLogUpdate?.call("📢 Executing local instant unsynced playback on Host...");
+    _executeCompensatedPlayback(track, Date.nowMs() + 600);
   }
 
   Future<void> broadcastPlayNoNtp(MediaTrack track) async {
     activeTrack = track;
     _hostAcousticDelay = 0;
+    _acousticOffset = 0;
     onLogUpdate?.call("📢 broadcastPlayNoNtp initiated. Firing instantly with 0ms delay.");
     
-    if (isOfflineMode && _bleSyncCharacteristic != null) {
-      final Map<String, dynamic> bleFrame = {
-        'cmd': 'PLAY',
-        'id': track.id,
-        'title': track.title,
-        'artist': track.artistName,
-        'delay': 0,
-      };
-      await _bleSyncCharacteristic!.write(utf8.encode(jsonEncode(bleFrame)));
-      _executeCompensatedPlayback(track, 0);
-    } else {
-      _sendSocketMessage('playback:play', {
-        'id': track.id,
-        'trackId': track.id,
-        'title': track.title,
-        'artistName': track.artistName,
-        'albumTitle': track.albumTitle,
-        'coverArtUrl': track.coverArtUrl,
-        'audioStreamUrl': track.audioStreamUrl,
-        'formatBadge': track.formatBadge,
-        'durationInSeconds': track.durationInSeconds,
-        'playAt': 0,
-        'isNoNtp': true,
-      });
+    _sendSocketMessage('playback:play', {
+      'id': track.id,
+      'trackId': track.id,
+      'title': track.title,
+      'artistName': track.artistName,
+      'albumTitle': track.albumTitle,
+      'coverArtUrl': track.coverArtUrl,
+      'audioStreamUrl': track.audioStreamUrl,
+      'formatBadge': track.formatBadge,
+      'durationInSeconds': track.durationInSeconds,
+      'playAt': 0,
+      'isNoNtp': true,
+    });
 
-      // Play locally immediately on the Host with 0ms delay
-      _executeCompensatedPlayback(track, 0);
-    }
+    // Play locally immediately on the Host with 0ms delay
+    _executeCompensatedPlayback(track, 0);
   }
 
   Future<void> broadcastPause() async {
-    if (isOfflineMode && _bleSyncCharacteristic != null) {
-      final bleFrame = {'cmd': 'PAUSE'};
-      await _bleSyncCharacteristic!.write(utf8.encode(jsonEncode(bleFrame)));
-      _musicPlayer.pause();
-      isSongPlaying = false;
-      onSongStateChanged?.call(false);
-    } else {
-      _sendSocketMessage('playback:pause', {});
-    }
+    _sendSocketMessage('playback:pause', {});
   }
 
   Future<void> broadcastSeek(double posSec) async {
-    if (isOfflineMode && _bleSyncCharacteristic != null) {
-      final bleFrame = {'cmd': 'SEEK', 'pos': posSec};
-      await _bleSyncCharacteristic!.write(utf8.encode(jsonEncode(bleFrame)));
-      _musicPlayer.seek(Duration(milliseconds: (posSec * 1000).round()));
-    } else {
-      _sendSocketMessage('playback:seek', {'positionInSeconds': posSec});
-    }
+    _sendSocketMessage('playback:seek', {'positionInSeconds': posSec});
   }
 
   /// Initialize continuous circular microphone stream
@@ -956,14 +896,30 @@ class PartySyncService {
         encoder: AudioEncoder.pcm16bits,
         sampleRate: rate,
         numChannels: channels,
+        autoGain: false,
+        echoCancel: false,
+        noiseSuppress: false,
       );
 
       final stream = await _audioRecorder.startStream(config);
       _isMicStreaming = true;
-      onLogUpdate?.call("🎙️ Mic circular buffer pipeline active (${rate}Hz).");
+      onLogUpdate?.call("🎙️ Mic circular buffer pipeline active (${rate}Hz, Raw No-DSP Mode).");
 
+      int chunkDiagCount = 0;
       _recorderSubscription = stream.listen((chunk) {
         final length = chunk.length;
+
+        // Calculate peak amplitude in this chunk to verify microphone activity
+        int maxSample = 0;
+        for (int i = 0; i < length - 1; i += 2) {
+          final int val = (chunk[i] | (chunk[i + 1] << 8)).toSigned(16).abs();
+          if (val > maxSample) maxSample = val;
+        }
+        chunkDiagCount++;
+        if (chunkDiagCount % 200 == 0) {
+          onLogUpdate?.call("🎙️ [Mic Diagnostic] Chunk #$chunkDiagCount | Peak Amplitude: $maxSample");
+        }
+
         if (_writePointer + length <= _circularBuffer.length) {
           _circularBuffer.setRange(_writePointer, _writePointer + length, chunk);
           _writePointer += length;
@@ -983,87 +939,16 @@ class PartySyncService {
     }
   }
 
-  /// BLE Offline coordination and discovery setup
-  Future<void> setupBleOfflineSync(String deviceId, {required bool isHost}) async {
-    isOfflineMode = true;
-    onLogUpdate?.call("🔵 Initializing Bluetooth BLE Offline Sync layer...");
-
-    if (!await FlutterBluePlus.isSupported) {
-      onLogUpdate?.call("❌ BLE is not supported on this device.");
-      return;
-    }
-
-    FlutterBluePlus.adapterState.listen((state) {
-      if (state != BluetoothAdapterState.on) {
-        onLogUpdate?.call("⚠️ Bluetooth adapter is turned off.");
-      }
-    });
-
-    if (isHost) {
-      // Host discovery advertise settings (In real app, starts BLE advertising)
-      onLogUpdate?.call("🔵 BLE Advertising Host: 'Spotify_Killer_Sync_Room'...");
-    } else {
-      // Client scans for Host
-      onLogUpdate?.call("🔍 Scanning for offline BLE Sync hosts...");
-      FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
-      
-      FlutterBluePlus.scanResults.listen((results) async {
-        for (ScanResult r in results) {
-          if (r.device.platformName.contains('Spotify_Killer') || r.device.remoteId.str == deviceId) {
-            FlutterBluePlus.stopScan();
-            _connectedBleDevice = r.device;
-            onLogUpdate?.call("🔗 Found BLE Host. Connecting to ${r.device.platformName}...");
-            await r.device.connect(license: License.nonprofit);
-            _discoverBleSyncServices(r.device);
-            break;
-          }
-        }
-      });
-    }
+  Future<void> _stopMicrophoneStream() async {
+    try {
+      await _recorderSubscription?.cancel();
+      _recorderSubscription = null;
+      await _audioRecorder.stop();
+    } catch (_) {}
+    _isMicStreaming = false;
   }
 
-  Future<void> _discoverBleSyncServices(BluetoothDevice device) async {
-    List<BluetoothService> services = await device.discoverServices();
-    for (BluetoothService service in services) {
-      for (BluetoothCharacteristic characteristic in service.characteristics) {
-        if (characteristic.properties.write || characteristic.properties.notify) {
-          _bleSyncCharacteristic = characteristic;
-          await characteristic.setNotifyValue(true);
-          
-          _bleSubscription = characteristic.onValueReceived.listen((value) {
-            final payload = jsonDecode(utf8.decode(value));
-            _handleBleOfflineFrame(payload);
-          });
-          onLogUpdate?.call("🔗 BLE Sync handshake completed. Offline alignment active!");
-        }
-      }
-    }
-  }
-
-  void _handleBleOfflineFrame(Map<String, dynamic> frame) {
-    final command = frame['cmd'];
-    if (command == 'PLAY') {
-      final track = MediaTrack(
-        id: frame['id'],
-        title: frame['title'],
-        artistName: frame['artist'],
-        albumTitle: 'Offline BLE Sync',
-        coverArtUrl: '',
-        audioStreamUrl: '',
-        formatBadge: 'Dolby Atmos',
-        durationInSeconds: 0,
-      );
-      activeTrack = track;
-      onTrackSynced?.call(track, true);
-      _executeCompensatedPlayback(track, frame['delay'] ?? 0);
-    } else if (command == 'PAUSE') {
-      _musicPlayer.pause();
-      isSongPlaying = false;
-      onSongStateChanged?.call(false);
-    } else if (command == 'SEEK') {
-      _musicPlayer.seek(Duration(milliseconds: ((frame['pos'] as double) * 1000).round()));
-    }
-  }
+  // BLE Offline coordination methods extracted to BleOfflineSyncService
 
   // --- AUDIO FILE UTILITIES ---
 
@@ -1128,7 +1013,7 @@ class PartySyncService {
     onSongStateChanged?.call(true);
   }
 
-  void _correlateGuestAndComputeConsensus(String userId, String username, int tSelf, int tCross) {
+  void _correlateGuestAndComputeConsensus(String userId, String username, int tSelf, int tCross, int guestSampleRate) {
     if (_hostCapturedMonoBuffer == null || _hostTSelf == null) return;
     
     // Calculate guest index in deterministic sorted list
@@ -1163,6 +1048,10 @@ class PartySyncService {
         missingDevice = "Host (missed $username)";
       }
 
+      if (simulateGuestDelay300ms) {
+        isFailure = false; // Force success to allow robust local testing bypass!
+      }
+
       if (isFailure) {
         onLogUpdate?.call("⚠️ Calibration failure detected! Missing: $missingDevice");
         onLogUpdate?.call("❌ Calibration failed. Falling back to default sync.");
@@ -1181,15 +1070,18 @@ class PartySyncService {
         return;
       }
 
-      // Success case: reset retry counter
-      _calibrationRetryCount = 0;
-
       onLogUpdate?.call("🎯 Peak located for $username: tCrossPc=$tCrossPc");
 
-      // Calculate relative delay offset using double chirps consensus
-      final double dtPhone = (tCross - tSelf) / DSPEngine.sampleRate;
-      final double dtPc = (tCrossPc - _hostTSelf!) / targetRate.toDouble();
-      final double rawMsOffset = ((dtPhone - dtPc) / 2) * 1000;
+      // Calculate relative delay offset using double chirps consensus with Guest's actual sample rate
+      double rawMsOffset = 0.0;
+      if (!simulateGuestDelay300ms) {
+        final double dtPhone = (tCross - tSelf) / guestSampleRate.toDouble();
+        final double dtPc = (tCrossPc - (_hostTSelf ?? 0)) / targetRate.toDouble();
+        rawMsOffset = ((dtPhone - dtPc) / 2) * 1000;
+      } else {
+        rawMsOffset = 300.0;
+        onLogUpdate?.call("🧪 Forcing +300ms failsafe test delay on Guest offset.");
+      }
 
       onLogUpdate?.call("🎯 Acoustic Sync consensus for $username: ${rawMsOffset.toStringAsFixed(2)} ms");
 
@@ -1204,6 +1096,7 @@ class PartySyncService {
         _hostAcousticDelay = rawMsOffset.abs().round();
         _sendSocketMessage('sync:offset', {
           'userId': userId,
+          'username': username,
           'offsetMs': 0,
         });
       } else {
@@ -1211,6 +1104,7 @@ class PartySyncService {
         _hostAcousticDelay = 0;
         _sendSocketMessage('sync:offset', {
           'userId': userId,
+          'username': username,
           'offsetMs': rawMsOffset.round(),
         });
       }
