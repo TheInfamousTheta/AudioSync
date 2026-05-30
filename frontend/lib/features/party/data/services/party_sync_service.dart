@@ -32,6 +32,7 @@ class PartySyncService {
   int _serverClockOffset = 0; // serverTime - localTime
   int _roundTripTime = 0;
   Timer? _ntpTimer;
+  bool _isNtpSuspended = false;
 
   // Circular audio recording buffer
   StreamSubscription<List<int>>? _recorderSubscription;
@@ -289,6 +290,7 @@ class PartySyncService {
     _acousticOffset = 0;
     _hostAcousticDelay = 0;
     _alignmentDataMap.clear();
+    _isNtpSuspended = false;
     stopAudio(); // Stop playback and mic on every disconnect
   }
 
@@ -300,6 +302,7 @@ class PartySyncService {
     _acousticOffset = 0;
     _hostAcousticDelay = 0;
     _alignmentDataMap.clear();
+    _isNtpSuspended = false;
     onSongStateChanged?.call(false);
     onLogUpdate?.call("🔇 Audio stopped and playback state reset.");
   }
@@ -311,6 +314,10 @@ class PartySyncService {
   }
 
   void _triggerWANTimesync() {
+    if (_isNtpSuspended) {
+      onLogUpdate?.call("⏳ Background NTP sync updates suspended to maintain active timeline lock.");
+      return;
+    }
     _sendSocketMessage('sync:ping', {'clientTx': Date.nowMs()});
   }
 
@@ -466,6 +473,7 @@ class PartySyncService {
 
   /// Dynamically synthesizes chirp on-demand, plays via Soloud, records mic, and processes in background Isolate
   Future<void> executeDynamicAcousticSync() async {
+    _isNtpSuspended = true;
     try {
       // 1. INSTANTLY STOP AND SILENCE MUSIC PLAYER TO PREVENT ACOUSTIC SATURATION
       try {
@@ -500,15 +508,15 @@ class PartySyncService {
 
       if (isHost) {
         selfChirpData = DSPEngine.generateChirpTemplate(
-          fStart: 1500.0,
-          fEnd: 3000.0,
+          fStart: 1000.0,
+          fEnd: 2000.0,
           targetSampleRate: targetRate,
         );
         crossChirpData = selfChirpData;
       } else {
         final int guestIndex = getMyGuestIndex();
-        final double cStart = 3500.0 + (guestIndex.clamp(0, 3) * 400.0);
-        final double cEnd = 3800.0 + (guestIndex.clamp(0, 3) * 400.0);
+        final double cStart = 2200.0 + (guestIndex.clamp(0, 3) * 450.0);
+        final double cEnd = 2500.0 + (guestIndex.clamp(0, 3) * 450.0);
 
         onLogUpdate?.call("⚡ Assigned Client dynamic sub-band: ${cStart.round()}–${cEnd.round()}Hz (Index: $guestIndex)");
 
@@ -518,8 +526,8 @@ class PartySyncService {
           targetSampleRate: targetRate,
         );
         crossChirpData = DSPEngine.generateChirpTemplate(
-          fStart: 1500.0,
-          fEnd: 3000.0,
+          fStart: 1000.0,
+          fEnd: 2000.0,
           targetSampleRate: targetRate,
         );
       }
@@ -558,6 +566,7 @@ class PartySyncService {
       if (!_isMicStreaming) {
         onLogUpdate?.call("⚠️ Microphone stream inactive. Cannot capture calibration snapshot.");
         _isAcousticSyncing = false;
+        _isNtpSuspended = false;
         onCalculationComplete?.call(0.0, 0.0, "❌ Calibration failed. Mic stream inactive.");
         
         // Send failed alignment immediately so we don't block
@@ -675,6 +684,7 @@ class PartySyncService {
     } catch (e, st) {
       onLogUpdate?.call("❌ Critical error inside executeDynamicAcousticSync: $e\n$st");
       _isAcousticSyncing = false;
+      _isNtpSuspended = false;
       onCalculationComplete?.call(0.0, 0.0, "❌ Calibration error: $e");
       if (isHost && _syncCompleter != null && !_syncCompleter!.isCompleted) {
         _syncCompleter!.complete();
@@ -682,8 +692,13 @@ class PartySyncService {
     }
   }
 
-  /// Compensated WAN execution
   Future<void> _executeCompensatedPlayback(MediaTrack track, int targetLocalTimeOrDelay) async {
+    _isNtpSuspended = true;
+    try {
+      await _stopMicrophoneStream();
+      await _resetAudioSessionToPlayback();
+    } catch (_) {}
+
     try {
       AudioSystemManager().player.stop();
     } catch (_) {}
@@ -798,7 +813,11 @@ class PartySyncService {
       );
     }
 
-    final playAt = Date.nowMs() + _serverClockOffset + (guests.isNotEmpty ? 1200 : 200) + _hostAcousticDelay;
+    final int schedulingWindow = track.id == 'test_sound_track'
+        ? (guests.isNotEmpty ? 1200 : 200)
+        : (guests.isNotEmpty ? 2500 : 600); // 2500ms for real remote song tracks to ensure robust buffering!
+
+    final playAt = Date.nowMs() + _serverClockOffset + schedulingWindow;
     // WebSocket server command broadcast
     _sendSocketMessage('playback:play', {
       'id': track.id,
@@ -948,6 +967,17 @@ class PartySyncService {
     _isMicStreaming = false;
   }
 
+  Future<void> _resetAudioSessionToPlayback() async {
+    try {
+      final session = await AudioSession.instance;
+      await session.configure(const AudioSessionConfiguration.music());
+      await session.setActive(true);
+      onLogUpdate?.call("🔊 Audio session successfully reset to high-fidelity Playback-only mode.");
+    } catch (e) {
+      onLogUpdate?.call("⚠️ Failed to restore audio session to high-fidelity playback: $e");
+    }
+  }
+
   // BLE Offline coordination methods extracted to BleOfflineSyncService
 
   // --- AUDIO FILE UTILITIES ---
@@ -1019,8 +1049,8 @@ class PartySyncService {
     // Calculate guest index in deterministic sorted list
     final int guestIndex = getGuestIndex(userId);
     
-    final double gStart = 3500.0 + (guestIndex.clamp(0, 3) * 400.0);
-    final double gEnd = 3800.0 + (guestIndex.clamp(0, 3) * 400.0);
+    final double gStart = 2200.0 + (guestIndex.clamp(0, 3) * 450.0);
+    final double gEnd = 2500.0 + (guestIndex.clamp(0, 3) * 450.0);
     final int targetRate = Platform.isWindows ? 48000 : DSPEngine.sampleRate;
 
     onLogUpdate?.call("⚡ Correlating $username on sub-band ${gStart.round()}–${gEnd.round()}Hz (Index: $guestIndex)...");
@@ -1064,6 +1094,8 @@ class PartySyncService {
           'offsetMs': 0,
         });
         
+        _isNtpSuspended = false;
+        
         if (_syncCompleter != null && !_syncCompleter!.isCompleted) {
           _syncCompleter!.complete();
         }
@@ -1074,13 +1106,19 @@ class PartySyncService {
 
       // Calculate relative delay offset using double chirps consensus with Guest's actual sample rate
       double rawMsOffset = 0.0;
-      if (!simulateGuestDelay300ms) {
+      bool isRealSyncSuccessful = (_hostTSelf != -1 && tSelf != -1 && tCross != -1 && tCrossPc != -1);
+
+      if (isRealSyncSuccessful) {
         final double dtPhone = (tCross - tSelf) / guestSampleRate.toDouble();
         final double dtPc = (tCrossPc - (_hostTSelf ?? 0)) / targetRate.toDouble();
         rawMsOffset = ((dtPhone - dtPc) / 2) * 1000;
       } else {
-        rawMsOffset = 300.0;
-        onLogUpdate?.call("🧪 Forcing +300ms failsafe test delay on Guest offset.");
+        rawMsOffset = 0.0;
+      }
+
+      if (simulateGuestDelay300ms) {
+        rawMsOffset -= 300.0;
+        onLogUpdate?.call("🧪 Adding +300ms simulated test delay. (Calculated sync: ${isRealSyncSuccessful ? (rawMsOffset + 300.0).toStringAsFixed(2) : 'failed, using 0ms fallback'} ms)");
       }
 
       onLogUpdate?.call("🎯 Acoustic Sync consensus for $username: ${rawMsOffset.toStringAsFixed(2)} ms");
@@ -1094,6 +1132,7 @@ class PartySyncService {
       if (rawMsOffset < 0) {
         // Host is leading: Host delays itself, Client plays immediately (0 delay)
         _hostAcousticDelay = rawMsOffset.abs().round();
+        _acousticOffset = _hostAcousticDelay;
         _sendSocketMessage('sync:offset', {
           'userId': userId,
           'username': username,
@@ -1102,6 +1141,7 @@ class PartySyncService {
       } else {
         // Client is leading: Client delays itself, Host plays immediately (0 delay)
         _hostAcousticDelay = 0;
+        _acousticOffset = 0;
         _sendSocketMessage('sync:offset', {
           'userId': userId,
           'username': username,

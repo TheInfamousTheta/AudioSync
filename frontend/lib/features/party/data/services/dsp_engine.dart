@@ -97,7 +97,7 @@ class DSPEngine {
     double avgNoise = sumScores / scores.length;
     
     // Peak-to-Noise Ratio (PNR) validation gate check
-    if ((globalMax / avgNoise) < 3.5) {
+    if ((globalMax / avgNoise) < 5.0) {
       return -1; 
     }
 
