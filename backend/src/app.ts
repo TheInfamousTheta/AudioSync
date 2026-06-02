@@ -5,11 +5,15 @@ import { mediaRouter } from './modules/media/media.controller';
 import { libraryRouter } from './modules/library/library.controller';
 import { authRouter } from './modules/auth/auth.controller';
 import { partyRouter } from './modules/party/party.controller';
+import { httpRateLimiter } from './config/rateLimit';
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+// Apply HTTP rate limiting to protect SQLite queries from abuse
+app.use('/api/v1', httpRateLimiter(60 * 1000, 100));
 
 // Mount the normalized music streams base path
 app.use('/api/v1/media', mediaRouter);

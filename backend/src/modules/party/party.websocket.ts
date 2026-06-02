@@ -1,9 +1,13 @@
 import { Server as HttpServer } from 'http';
 import WebSocket, { WebSocketServer } from 'ws';
 import url from 'url';
+import crypto from 'crypto';
 import { AuthService } from '../auth/auth.service';
+import { checkWsRateLimit } from '../../config/rateLimit';
+import { initializeRedis, publishToParty, isRedisEnabled } from '../../config/redis';
 
 const authService = new AuthService();
+const instanceId = crypto.randomBytes(16).toString('hex');
 
 // Registry mapping partyId -> Set of active client sockets
 const partyRooms = new Map<string, Set<WebSocket>>();
@@ -14,10 +18,44 @@ const socketMetadata = new Map<WebSocket, { partyId?: string; userId: string; us
 export function initializePartyWebSocket(server: HttpServer) {
   const wss = new WebSocketServer({ noServer: true });
 
+  // Initialize Redis Pub/Sub listener
+  initializeRedis((channel, message) => {
+    try {
+      const { partyId, event, data, excludeUserId, originInstanceId } = JSON.parse(message);
+      if (originInstanceId === instanceId) {
+        return; // Skip self-sent messages already broadcasted locally
+      }
+      const room = partyRooms.get(partyId);
+      if (room) {
+        const payload = JSON.stringify({ event, data });
+        room.forEach((client) => {
+          const meta = socketMetadata.get(client);
+          if (meta && meta.userId !== excludeUserId && client.readyState === WebSocket.OPEN) {
+            client.send(payload);
+          }
+        });
+      }
+    } catch (err: any) {
+      console.error('[WS/Redis] Error handling subscribed broadcast:', err.message);
+    }
+  }).catch((err) => {
+    console.error('[WS/Redis] Failed to initialize Redis subscriber:', err.message);
+  });
+
   server.on('upgrade', async (request, socket, head) => {
     const pathname = url.parse(request.url || '').pathname;
     
     if (pathname === '/api/v1/party/sync') {
+      const ip = request.socket.remoteAddress || 'unknown';
+
+      // Rate limit WS Handshakes: 5 upgrades per 10 seconds per IP
+      if (!checkWsRateLimit(ip, 10000, 5)) {
+        console.log(`[WS] Handshake rate limited for IP: ${ip}`);
+        socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
       const query = url.parse(request.url || '', true).query;
       const token = query.token as string;
 
@@ -236,6 +274,17 @@ function leaveRoom(ws: WebSocket, partyId: string) {
 }
 
 function broadcastToRoom(partyId: string, event: string, data: any, excludeSocket?: WebSocket) {
+  const meta = excludeSocket ? socketMetadata.get(excludeSocket) : undefined;
+  const excludeUserId = meta?.userId;
+
+  // Publish to Redis channel for multi-instance distribution
+  if (isRedisEnabled) {
+    publishToParty(partyId, event, data, excludeUserId, instanceId).catch((err) => {
+      console.error(`[WS/Redis] Failed to publish message:`, err.message);
+    });
+  }
+
+  // Broadcast to local room clients directly (low latency)
   const room = partyRooms.get(partyId);
   if (!room) return;
 

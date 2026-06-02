@@ -35,6 +35,21 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+
+            // Instructs the NDK compiler to completely strip debug symbols
+            ndk {
+                debugSymbolLevel = "NONE"
+            }
+
+            // Enables ProGuard/R8 code minification and aggressive resource shrinking
+            isMinifyEnabled = true
+            isShrinkResources = true
+            
+            // Grabs the default Android optimization rules
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 }

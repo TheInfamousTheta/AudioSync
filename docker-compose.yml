@@ -1,6 +1,12 @@
 version: '3.8'
 
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: always
+
   jiosaavn-api:
     build:
       context: https://github.com/sumitkolhe/jiosaavn-api.git#main
@@ -20,8 +26,11 @@ services:
       - PORT=4000
       - SAAVN_API_URL=http://jiosaavn-api:3000
       - DATABASE_PATH=/app/data/db.sqlite
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     depends_on:
       - jiosaavn-api
+      - redis
     restart: always
 
 volumes:
