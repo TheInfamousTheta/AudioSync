@@ -104,3 +104,30 @@ Predictive audio caching operates under strict memory constraints (200 MB maximu
 - **Eviction Policy**: Sweeps `/track_cache_*.mp3` files chronologically (oldest modified). 
 - **Target Utilization**: Evicts files until total size reduces to 70% of maximum budget ($\le 140$ MB).
 - Utilizes `touchFile()` access updates to maintain cache relevancy.
+
+## 7. Debugging Matrix & Output Console
+
+When compiled in `kDebugMode`, the Party Screen exposes a specialized **Debug Matrix & Output Console** for engineers.
+- **Calibration Status**: Real-time display of alignment state (e.g., Lock status, raw ms delays).
+- **System Output Console Logs**: A scrolling list of internal DSP and Network emissions with a quick-copy clipboard button.
+- **Test Signal Generators (Host)**: Buttons to trigger artificial LFM pops (`SYNCED POP`, `NTP ONLY`, `NO NTP`) to isolate network vs acoustic sync logic.
+- **Delay Injector**: A toggle to simulate a `+300ms` guest delay (`simulateGuestDelay300ms`). In testing, this guarantees the two test pops do not acoustically overlap, creating a clean temporal gap so the delta can be measured precisely.
+
+## 8. Testing Methodology (Latency Verification)
+
+To empirically verify the sub-5ms acoustic alignment claim, testing was conducted in a real-world environment using a three-device setup:
+- **Device 1 & 2 (Android)**: Ran the AudioSync application.
+- **Device 3 (iPhone)**: Acted as an external, high-fidelity measurement microphone. **Crucially, the iPhone was placed exactly equidistant between the two Android devices** to neutralize speed-of-sound propagation delays ($\approx 1\text{ms}$ per $34\text{cm}$).
+
+### Debug & Calibration Setup
+When the app is compiled and run in debug mode, a specialized **Debugging Section** becomes available in the Party Screen. This interface exposes raw sync variables and allows manual injection of artificial offsets. 
+- **Artificial Skew**: A simulated `+300ms` delay was injected into one of the Android devices, while the other remained exactly on time. By separating the sounds, the microphone captures two distinct, non-overlapping spikes.
+- **Test Signal**: Instead of playing a music track, the debugging suite triggers a sharp, rapidly decaying `2500Hz` LFM click/pop test sound on both devices simultaneously.
+
+### Verification Script
+The iPhone recorded the combined output of both Android devices in a normal acoustic room environment (preserving natural echoes and room reverb). 
+1. The external audio capture was processed by an external Python script.
+2. The script measured the true temporal $\Delta t$ between the two `2500Hz` audio spikes.
+3. The effective sync latency was calculated using the absolute error formula:
+
+$$ \text{Effective Latency} = \left| \Delta t_{measured} - 300\text{ms} \right| $$
